@@ -2,6 +2,7 @@
 
 pub mod arq;
 pub mod cli;
+pub mod crypto;
 pub mod dns;
 pub mod filter;
 pub mod session;

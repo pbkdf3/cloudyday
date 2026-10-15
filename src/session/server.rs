@@ -5,25 +5,28 @@ use std::io;
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::net::UdpSocket;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::reverse::{self, Streams};
 use super::{
     ACK_BATCH, Budget, Chunk, HasPipe, IoEvent, IoKind, MAX_STREAMS, OPEN_DEADLINE, Packer, Pipe,
-    Reservation, ResetRepeats, SESSION_EXPIRY, TokenBucket, Tombstone, Tombstones, WRITE_QUEUE,
-    now, pack_acks, pack_data,
+    Reservation, ResetRepeats, SESSION_EXPIRY, TokenBucket, Tombstone, Tombstones, now, pack_acks,
+    pack_data,
 };
 use crate::arq::{Delivery, Rtt};
+use crate::crypto::{SessionKeys, SharedSecret};
 use crate::dns::{self, Sizes, TunnelDomain};
+use crate::socks;
 use crate::wire::{
     CookieInput, Direction, Envelope, Frame, MAX_OPEN_RECORD, NONCE_LEN, OpenResult,
-    SERVER_HEADER_LEN, StreamAck, Target, WireError, XorKey, peek_ids, reset, response_evidence,
+    SERVER_HEADER_LEN, StreamAck, Target, VERSION, peek_ids, reset, response_evidence,
     session_error, status,
 };
-use crate::{filter, socks};
 
 pub const MAX_SESSIONS: usize = 64;
 pub const BUFFER_LIMIT: usize = 32 << 20;
@@ -59,7 +62,7 @@ pub enum Action {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum IdCheck {
+pub(super) enum IdCheck {
     Fresh,
     TooOld,
     Used,
@@ -68,13 +71,13 @@ enum IdCheck {
 /// High-water mark plus used-ID bitmap (A.5). Bits are never cleared while
 /// their IDs remain in the window.
 #[derive(Debug, Default)]
-struct StreamIds {
+pub(super) struct StreamIds {
     high: u32,
     bits: u64,
 }
 
 impl StreamIds {
-    fn check(&mut self, id: u32) -> IdCheck {
+    pub(super) fn check(&mut self, id: u32) -> IdCheck {
         let low = self.high.saturating_sub(STREAM_ID_WINDOW - 1).max(1);
         if id < low {
             return IdCheck::TooOld;
@@ -136,8 +139,8 @@ struct CachedResponse {
     _hold: Reservation,
 }
 
-/// Plain response envelopes for recent exchanges, so a duplicate query gets
-/// the identical envelope instead of stranding dequeued frames.
+/// Ciphertext response envelopes for recent exchanges, so duplicates replay
+/// identical ciphertext without reusing a nonce for different plaintext.
 #[derive(Debug, Default)]
 struct ResponseCache {
     entries: VecDeque<CachedResponse>,
@@ -235,6 +238,8 @@ struct Session {
     highest_received: Option<u32>,
     resets: ResetRepeats,
     cursor: u32,
+    reverse: Streams,
+    crypto: SessionKeys,
 }
 
 enum Step {
@@ -243,7 +248,7 @@ enum Step {
 }
 
 impl Session {
-    fn new(id: u32, now: Instant) -> Session {
+    fn new(id: u32, now: Instant, sizes: Sizes, budget: Budget, crypto: SessionKeys) -> Session {
         Session {
             id,
             last_activity: now,
@@ -256,6 +261,8 @@ impl Session {
             highest_received: None,
             resets: ResetRepeats::default(),
             cursor: 0,
+            reverse: Streams::new(true, sizes.d, sizes.u, budget, Arc::new(AtomicU64::new(1))),
+            crypto,
         }
     }
 
@@ -281,6 +288,13 @@ impl Session {
         let mut must_ack = BTreeSet::new();
         let mut replies = Vec::new();
         for frame in env.frames {
+            if reverse::is_reverse(&frame) {
+                if let Frame::Segment { stream, .. } | Frame::Fin { stream, .. } = &frame {
+                    must_ack.insert(*stream);
+                }
+                self.reverse.apply(frame, now, 0);
+                continue;
+            }
             match frame {
                 Frame::StreamAck(ack) => self.on_ack(&ack, now, sh),
                 Frame::Segment {
@@ -308,9 +322,14 @@ impl Session {
         for id in ids {
             self.drive(id, now, sh);
         }
-        let envelope = self
+        let mut envelope = self
             .respond(env.exchange_id, capacity, &must_ack, replies, now, sh)
             .encode();
+        self.crypto
+            .apply(&mut envelope, Direction::ServerToClient)
+            .expect("session envelope");
+        // Cache the ciphertext itself. A duplicate exchange must NEVER encrypt
+        // a different response under this same session key and nonce.
         self.cache
             .insert(env.exchange_id, envelope.clone(), now, &sh.budget);
         Some(envelope)
@@ -370,7 +389,7 @@ impl Session {
                     reason: reset::UNKNOWN_STREAM,
                 });
             }
-            if self.streams.len() >= MAX_STREAMS {
+            if self.streams.len() + self.reverse.len() >= MAX_STREAMS {
                 warn!(session = self.id, "stream limit reached");
                 return replies.push(Frame::Reset {
                     stream,
@@ -445,6 +464,7 @@ impl Session {
         let evidence = self
             .highest_received
             .and_then(|h| h.checked_sub(REORDER_ALLOWANCE));
+        self.reverse.timers(now, rto, evidence);
         for stream in self.streams.values_mut() {
             let send = &mut stream.pipe.send;
             if let Some(limit) = evidence {
@@ -524,6 +544,12 @@ impl Session {
         let mut broken = Vec::new();
         // Mandatory: an ACK for every stream that had SEGMENT or FIN frames.
         for &id in must_ack {
+            if id >= reverse::FIRST_ID {
+                if let Some(frame) = self.reverse.mandatory_ack(id, now) {
+                    packer.push(frame);
+                }
+                continue;
+            }
             if let Some(stream) = self.streams.get_mut(&id) {
                 match stream.pipe.ack(id) {
                     Ok(ack) => {
@@ -547,6 +573,11 @@ impl Session {
             stream.pipe.credit_repeat_due(now);
         }
         broken.extend(pack_acks(&mut self.streams, &mut packer, ACK_BATCH));
+        self.reverse.pack_acks(&mut packer, now, ACK_BATCH);
+        if exchange.is_multiple_of(2) {
+            self.reverse
+                .pack_data(&mut packer, exchange, usize::MAX, now);
+        }
         pack_data(
             &mut self.streams,
             &mut self.cursor,
@@ -555,11 +586,17 @@ impl Session {
             usize::MAX,
             now,
         );
+        if !exchange.is_multiple_of(2) {
+            self.reverse
+                .pack_data(&mut packer, exchange, usize::MAX, now);
+        }
         broken.extend(pack_acks(&mut self.streams, &mut packer, usize::MAX));
+        self.reverse.pack_acks(&mut packer, now, usize::MAX);
         for id in broken {
             self.abort(id, reset::EXHAUSTED, now, sh);
         }
-        let more_pending = self.resets.due(now)
+        let more_pending = self.reverse.pending(now)
+            || self.resets.due(now)
             || self
                 .streams
                 .values()
@@ -633,6 +670,7 @@ impl Session {
     }
 
     fn housekeeping(&mut self, now: Instant, sh: &mut Shared) {
+        self.reverse.timers(now, self.rtt.rto(), None);
         let mut aborts = Vec::new();
         for (&id, stream) in &self.streams {
             if stream.pipe.stalled(now) {
@@ -655,7 +693,7 @@ impl Session {
 /// responses and dial actions out.
 pub struct ServerCore {
     domain: TunnelDomain,
-    key: XorKey,
+    key: SharedSecret,
     secret: [u8; 32],
     sessions: HashMap<u32, Session>,
     shared: Shared,
@@ -663,10 +701,17 @@ pub struct ServerCore {
     handshakes: HashMap<[u8; 52], (u32, u64)>,
     handshake_rate: TokenBucket,
     error_rate: HashMap<IpAddr, TokenBucket>,
+    reverse_enabled: bool,
+    active_session: Option<u32>,
+    replaced: HashMap<u32, Instant>,
 }
 
 impl ServerCore {
-    pub fn new(domain: TunnelDomain, key: XorKey, budget: Budget) -> Result<ServerCore, String> {
+    pub fn new(
+        domain: TunnelDomain,
+        key: SharedSecret,
+        budget: Budget,
+    ) -> Result<ServerCore, String> {
         let sizes = domain.sizes()?;
         let start = now();
         Ok(ServerCore {
@@ -684,7 +729,34 @@ impl ServerCore {
             handshakes: HashMap::new(),
             handshake_rate: TokenBucket::new(10.0, 20.0, start),
             error_rate: HashMap::new(),
+            reverse_enabled: false,
+            active_session: None,
+            replaced: HashMap::new(),
         })
+    }
+
+    /// Enable single-client reverse SOCKS ownership before accepting sessions.
+    pub fn enable_reverse(&mut self) {
+        self.reverse_enabled = true;
+    }
+
+    pub fn active_session(&self) -> Option<u32> {
+        self.active_session
+            .filter(|id| self.sessions.contains_key(id))
+    }
+
+    /// SOCKS events are tagged with the session that owned the listener at accept
+    /// time, so a slow negotiation cannot move to a replacement client.
+    pub fn handle_reverse_io(&mut self, session_id: u32, event: IoEvent, now: Instant) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            if matches!(event.kind, IoKind::Open { .. }) {
+                let available =
+                    MAX_STREAMS.saturating_sub(session.streams.len() + session.reverse.len());
+                session.reverse.open(event, now, available);
+            } else {
+                session.reverse.handle_io(event, now);
+            }
+        }
     }
 
     pub fn take_actions(&mut self) -> Vec<Action> {
@@ -709,35 +781,44 @@ impl ServerCore {
         let Some(mut payload) = query.tunnel_payload(prefix) else {
             return Some(query.non_tunnel_answer(prefix));
         };
-        self.key.apply(&mut payload);
+        let (session_id, exchange) = peek_ids(&payload)?;
+        if exchange == 0 {
+            return None;
+        }
         let capacity = dns::response_capacity(query.question_len());
-        let response = match Envelope::decode(&payload, Direction::ClientToServer) {
-            Ok(env) if env.session_id == 0 => self.handshake(&env, now, unix)?.encode(),
-            Ok(env) => match self.sessions.get_mut(&env.session_id) {
-                Some(session) => session.handle(env, capacity, now, &mut self.shared)?,
-                None => self.session_error(
-                    src,
-                    env.session_id,
-                    env.exchange_id,
-                    session_error::UNKNOWN_SESSION,
-                    now,
-                )?,
-            },
-            Err(WireError::UnsupportedVersion) => {
-                let (session, exchange) = peek_ids(&payload)?;
-                self.session_error(
-                    src,
-                    session,
-                    exchange,
-                    session_error::UNSUPPORTED_VERSION,
-                    now,
-                )?
-            }
-            Err(_) => return Some(query.non_tunnel_answer(prefix)),
+        let response = if payload[0] >> 5 != VERSION {
+            self.session_error(
+                src,
+                session_id,
+                exchange,
+                session_error::UNSUPPORTED_VERSION,
+                now,
+            )?
+        } else if session_id == 0 {
+            let env = Envelope::decode(&payload, Direction::ClientToServer).ok()?;
+            self.handshake(&env, now, unix)?.encode()
+        } else if let Some(session) = self.sessions.get_mut(&session_id) {
+            session
+                .crypto
+                .apply(&mut payload, Direction::ClientToServer)?;
+            let env = Envelope::decode(&payload, Direction::ClientToServer).ok()?;
+            session.handle(env, capacity, now, &mut self.shared)?
+        } else {
+            self.session_error(
+                src,
+                session_id,
+                exchange,
+                if self.replaced.contains_key(&session_id) {
+                    session_error::REPLACED
+                } else {
+                    session_error::UNKNOWN_SESSION
+                },
+                now,
+            )?
         };
-        let mut xored = response;
-        self.key.apply(&mut xored);
-        let packet = query.tunnel_response(&xored);
+        // Handshakes and marked session errors are public; session.handle has
+        // already encrypted (or replayed the cached ciphertext of) its response.
+        let packet = query.tunnel_response(&response);
         if packet.is_none() {
             error!("internal error: response exceeds the 512-byte budget");
         }
@@ -801,6 +882,7 @@ impl ServerCore {
                 client_nonce,
                 server_nonce,
                 cookie,
+                proof,
             } => {
                 if !self
                     .cookie_input(client_nonce, server_nonce)
@@ -810,13 +892,31 @@ impl ServerCore {
                         reason: session_error::HANDSHAKE_EXPIRED,
                     }
                 } else {
+                    let input = self.cookie_input(client_nonce, server_nonce);
+                    if !self.key.verify_client(&input, cookie, proof) {
+                        debug!("handshake authentication failed");
+                        return None; // No allocation, dial, listener, or takeover.
+                    }
                     self.handshakes.retain(|_, &mut (_, expiry)| expiry > unix);
                     let mut body = [0u8; 52];
                     body[..16].copy_from_slice(client_nonce);
                     body[16..32].copy_from_slice(server_nonce);
                     body[32..].copy_from_slice(cookie);
                     if let Some(&(session_id, _)) = self.handshakes.get(&body) {
-                        Frame::Accept { session_id }
+                        if self.replaced.contains_key(&session_id) {
+                            Frame::SessionError {
+                                reason: session_error::REPLACED,
+                            }
+                        } else {
+                            Frame::Accept {
+                                session_id,
+                                proof: self.key.server_proof(
+                                    &self.cookie_input(client_nonce, server_nonce),
+                                    cookie,
+                                    session_id,
+                                ),
+                            }
+                        }
                     } else if self.handshakes.len() >= MAX_HANDSHAKES
                         || self.sessions.len() >= MAX_SESSIONS
                     {
@@ -827,10 +927,45 @@ impl ServerCore {
                         let expiry =
                             u64::from(u32::from_be_bytes(cookie[..4].try_into().expect("4 bytes")));
                         self.handshakes.insert(body, (session_id, expiry));
-                        self.sessions
-                            .insert(session_id, Session::new(session_id, now));
+                        if self.reverse_enabled {
+                            for old_id in self.sessions.keys().copied() {
+                                self.replaced.insert(old_id, now + SESSION_EXPIRY);
+                            }
+                            // Bound replacement tombstones without evicting live sessions.
+                            if self.replaced.len() > MAX_HANDSHAKES
+                                && let Some((&oldest, _)) =
+                                    self.replaced.iter().min_by_key(|(_, until)| *until)
+                            {
+                                self.replaced.remove(&oldest);
+                            }
+                            self.sessions.clear();
+                            self.shared.keys.clear();
+                            self.shared.actions.clear();
+                            self.active_session = Some(session_id);
+                        }
+                        self.sessions.insert(
+                            session_id,
+                            Session::new(
+                                session_id,
+                                now,
+                                sizes,
+                                self.shared.budget.clone(),
+                                self.key.session_keys(
+                                    &self.cookie_input(client_nonce, server_nonce),
+                                    cookie,
+                                    session_id,
+                                ),
+                            ),
+                        );
                         info!(session = format!("{session_id:08x}"), "session established");
-                        Frame::Accept { session_id }
+                        Frame::Accept {
+                            session_id,
+                            proof: self.key.server_proof(
+                                &self.cookie_input(client_nonce, server_nonce),
+                                cookie,
+                                session_id,
+                            ),
+                        }
                     }
                 }
             }
@@ -895,6 +1030,7 @@ impl ServerCore {
             session.housekeeping(now, shared);
         }
         self.handshakes.retain(|_, &mut (_, expiry)| expiry > unix);
+        self.replaced.retain(|_, until| now < *until);
         self.error_rate.retain(|_, bucket| !bucket.full(now));
     }
 
@@ -907,8 +1043,10 @@ impl ServerCore {
 
 pub struct ServerOptions {
     pub domain: TunnelDomain,
-    pub key: XorKey,
+    pub key: SharedSecret,
     pub allow_private: bool,
+    /// Open this SOCKS listener while a client owns the reverse proxy.
+    pub reverse_socks: Option<SocketAddr>,
 }
 
 /// The UDP DNS server and its destination bridges.
@@ -917,19 +1055,24 @@ pub struct Server {
     core: ServerCore,
     budget: Budget,
     allow_private: bool,
+    reverse_socks: Option<SocketAddr>,
 }
 
 impl Server {
     pub async fn bind(listen: SocketAddr, options: ServerOptions) -> io::Result<Server> {
         let budget = Budget::new(BUFFER_LIMIT);
-        let core = ServerCore::new(options.domain, options.key, budget.clone())
+        let mut core = ServerCore::new(options.domain, options.key, budget.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if options.reverse_socks.is_some() {
+            core.enable_reverse();
+        }
         let socket = UdpSocket::bind(listen).await?;
         Ok(Server {
             socket,
             core,
             budget,
             allow_private: options.allow_private,
+            reverse_socks: options.reverse_socks,
         })
     }
 
@@ -939,6 +1082,11 @@ impl Server {
 
     pub async fn run(mut self) -> io::Result<()> {
         let (events_tx, mut events) = mpsc::channel(1024);
+        let (reverse_tx, mut reverse_events) = mpsc::channel(1024);
+        let mut reverse_tasks = tokio::task::JoinSet::new();
+        let mut listener: Option<TcpListener> = None;
+        let mut owner = None;
+        let mut next_reverse_key = reverse::KEY_BIT;
         let mut buf = vec![0u8; 65535];
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -955,48 +1103,66 @@ impl Server {
                     Err(e) => debug!(%e, "receive failed"),
                 },
                 Some(event) = events.recv() => self.core.handle_io(event, now()),
+                Some((session_id, event)) = reverse_events.recv() =>
+                    self.core.handle_reverse_io(session_id, event, now()),
+                accepted = async {
+                    match &listener {
+                        Some(listener) => listener.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let (tcp, peer) = accepted?;
+                    let session_id = owner.expect("listener has an owner");
+                    let key = next_reverse_key;
+                    next_reverse_key += 1;
+                    let reverse_tx = reverse_tx.clone();
+                    let _ = tcp.set_nodelay(true);
+                    debug!(%peer, session = session_id, "reverse SOCKS connection");
+                    reverse_tasks.spawn(async move {
+                        let (events_tx, mut events) = mpsc::channel(64);
+                        let serve = socks::serve(tcp, key, events_tx, segment);
+                        tokio::pin!(serve);
+                        loop {
+                            tokio::select! {
+                                _ = &mut serve => break,
+                                Some(event) = events.recv() => {
+                                    if reverse_tx.send((session_id, event)).await.is_err() { break; }
+                                }
+                            }
+                        }
+                    });
+                }
+                _ = reverse_tasks.join_next(), if !reverse_tasks.is_empty() => {}
                 _ = tick.tick() => self.core.housekeeping(now(), unix_now()),
             }
+            let active = self.core.active_session();
+            if active != owner {
+                reverse_tasks.abort_all();
+                owner = active;
+                if owner.is_none() {
+                    listener = None;
+                    info!("reverse SOCKS listener closed: no client connected");
+                } else if listener.is_none()
+                    && let Some(addr) = self.reverse_socks
+                {
+                    let bound = TcpListener::bind(addr).await.map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("cannot bind reverse SOCKS listener {addr}: {e}"),
+                        )
+                    })?;
+                    info!(socks = %bound.local_addr()?, "reverse SOCKS listener ready");
+                    listener = Some(bound);
+                }
+            }
             for action in self.core.take_actions() {
-                let Action::Dial {
-                    key,
-                    target,
-                    deadline,
-                } = action;
-                let events = events_tx.clone();
-                let budget = self.budget.clone();
-                let allow_private = self.allow_private;
-                tokio::spawn(async move {
-                    let deadline = tokio::time::Instant::from_std(deadline);
-                    let kind = match filter::dial(&target, deadline, allow_private).await {
-                        Ok(tcp) => {
-                            let local = tcp
-                                .local_addr()
-                                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-                            let (writer, writes) = mpsc::channel(WRITE_QUEUE);
-                            let permits = Arc::new(Semaphore::new(0));
-                            let connected = IoKind::Connected {
-                                writer,
-                                permits: permits.clone(),
-                                local,
-                            };
-                            if events
-                                .send(IoEvent {
-                                    key,
-                                    kind: connected,
-                                })
-                                .await
-                                .is_ok()
-                            {
-                                socks::bridge(tcp, key, segment, events, permits, writes, budget)
-                                    .await;
-                            }
-                            return;
-                        }
-                        Err(code) => IoKind::DialFailed(code),
-                    };
-                    let _ = events.send(IoEvent { key, kind }).await;
-                });
+                socks::spawn_dial(
+                    action,
+                    events_tx.clone(),
+                    segment,
+                    self.budget.clone(),
+                    self.allow_private,
+                );
             }
         }
     }
@@ -1006,19 +1172,16 @@ impl Server {
 mod tests {
     use super::*;
     use crate::dns::build_query;
+    use crate::session::WRITE_QUEUE;
     use crate::wire::{Host, LAG_UNKNOWN};
+    use tokio::sync::Semaphore;
 
     const UNIX: u64 = 1_700_000_000;
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .map(|b| u8::from_str_radix(b, 16).unwrap())
-            .collect()
-    }
-
     struct Harness {
         core: ServerCore,
-        key: XorKey,
+        key: SharedSecret,
+        crypto: HashMap<u32, SessionKeys>,
         domain: TunnelDomain,
         t0: Instant,
         src: SocketAddr,
@@ -1027,13 +1190,14 @@ mod tests {
     impl Harness {
         fn new() -> Harness {
             let domain = TunnelDomain::parse("t.example.com").unwrap();
-            let key = XorKey::new(hex("5a a5 3c")).unwrap();
+            let key = SharedSecret::new((0..32).collect()).unwrap();
             let core = ServerCore::new(domain.clone(), key.clone(), Budget::new(BUFFER_LIMIT))
                 .unwrap()
                 .with_secret(std::array::from_fn(|i| i as u8));
             Harness {
                 core,
                 key,
+                crypto: HashMap::new(),
                 domain,
                 t0: Instant::now(),
                 src: "192.0.2.1:5353".parse().unwrap(),
@@ -1042,18 +1206,54 @@ mod tests {
 
         fn exchange_at(&mut self, env: &Envelope, at: Duration, unix: u64) -> Option<Envelope> {
             let mut bytes = env.encode();
-            self.key.apply(&mut bytes);
+            if let Some(keys) = self.crypto.get(&env.session_id) {
+                keys.apply(&mut bytes, Direction::ClientToServer).unwrap();
+            }
             let query = build_query(0x4242, &bytes, &self.domain).unwrap();
             let packet = self
                 .core
                 .handle_datagram(self.src, &query.packet, self.t0 + at, unix)?;
             let mut payload = dns::parse_response(&packet, &query.qname).unwrap();
-            self.key.apply(&mut payload);
-            Some(Envelope::decode(&payload, Direction::ServerToClient).unwrap())
+            if payload[0] & crate::wire::FLAG_PLAIN_ERROR == 0
+                && let Some(keys) = self.crypto.get(&env.session_id)
+            {
+                keys.apply(&mut payload, Direction::ServerToClient).unwrap();
+            }
+            let response = Envelope::decode(&payload, Direction::ServerToClient).unwrap();
+            if let [
+                Frame::CookieEcho {
+                    client_nonce,
+                    server_nonce,
+                    cookie,
+                    ..
+                },
+            ] = env.frames.as_slice()
+                && let [Frame::Accept { session_id, proof }] = response.frames.as_slice()
+            {
+                let input = self.core.cookie_input(client_nonce, server_nonce);
+                assert!(self.key.verify_server(&input, cookie, *session_id, proof));
+                self.crypto.insert(
+                    *session_id,
+                    self.key.session_keys(&input, cookie, *session_id),
+                );
+            }
+            Some(response)
         }
 
         fn exchange(&mut self, env: &Envelope) -> Option<Envelope> {
             self.exchange_at(env, Duration::ZERO, UNIX)
+        }
+
+        fn echo(&self, client_nonce: [u8; 16], server_nonce: [u8; 16], cookie: [u8; 20]) -> Frame {
+            Frame::CookieEcho {
+                client_nonce,
+                server_nonce,
+                cookie,
+                proof: self.key.client_proof(
+                    &self.core.cookie_input(&client_nonce, &server_nonce),
+                    &cookie,
+                ),
+            }
         }
 
         fn establish(&mut self) -> u32 {
@@ -1076,15 +1276,11 @@ mod tests {
                 panic!()
             };
             assert_eq!((u, d), (111, 182));
-            let echo = Frame::CookieEcho {
-                client_nonce: cn,
-                server_nonce,
-                cookie,
-            };
+            let echo = self.echo(cn, server_nonce, cookie);
             let accept = self
                 .exchange(&Envelope::client(0, 2, LAG_UNKNOWN, vec![echo]))
                 .unwrap();
-            let Frame::Accept { session_id } = accept.frames[0] else {
+            let Frame::Accept { session_id, .. } = accept.frames[0] else {
                 panic!("{accept:?}")
             };
             session_id
@@ -1105,6 +1301,153 @@ mod tests {
 
     fn dials(core: &mut ServerCore) -> usize {
         core.take_actions().len()
+    }
+
+    #[test]
+    fn reverse_replaces_sessions_but_duplicate_handshakes_never_reclaim_ownership() {
+        let mut h = Harness::new();
+        h.core.enable_reverse();
+        let first = h.establish();
+        let body = *h.core.handshakes.keys().next().unwrap();
+        let echo = Envelope::client(
+            0,
+            10,
+            LAG_UNKNOWN,
+            vec![h.echo(
+                body[..16].try_into().unwrap(),
+                body[16..32].try_into().unwrap(),
+                body[32..].try_into().unwrap(),
+            )],
+        );
+        // A retransmission of the current owner's COOKIE_ECHO is idempotent.
+        assert!(matches!(h.exchange(&echo).unwrap().frames.as_slice(),
+            [Frame::Accept { session_id, .. }] if *session_id == first));
+        let second = h.establish();
+        assert_ne!(first, second);
+        assert_eq!(h.core.session_count(), 1);
+        assert_eq!(h.core.active_session(), Some(second));
+        assert_eq!(
+            h.exchange(&echo).unwrap().frames,
+            vec![Frame::SessionError {
+                reason: session_error::REPLACED
+            }]
+        );
+        assert_eq!(h.core.active_session(), Some(second));
+        assert_eq!(
+            h.exchange(&Envelope::client(first, 1, LAG_UNKNOWN, vec![]))
+                .unwrap()
+                .frames,
+            vec![Frame::SessionError {
+                reason: session_error::REPLACED
+            }]
+        );
+        h.core
+            .housekeeping(h.t0 + SESSION_EXPIRY, UNIX + SESSION_EXPIRY.as_secs());
+        assert_eq!(h.core.session_count(), 0);
+        assert_eq!(h.core.active_session(), None);
+    }
+
+    #[test]
+    fn bad_secret_and_proof_never_allocate_or_take_over_a_session() {
+        let mut h = Harness::new();
+        h.core.enable_reverse();
+        let owner = h.establish();
+        let response = h
+            .exchange(&Envelope::client(
+                0,
+                1,
+                LAG_UNKNOWN,
+                vec![Frame::Hello {
+                    client_nonce: [9; 16],
+                }],
+            ))
+            .unwrap();
+        let Frame::Challenge {
+            server_nonce,
+            cookie,
+            ..
+        } = response.frames[0]
+        else {
+            panic!()
+        };
+        let bad_secret = SharedSecret::new(vec![9; 32]).unwrap();
+        let bad_echo = Frame::CookieEcho {
+            client_nonce: [9; 16],
+            server_nonce,
+            cookie,
+            proof: bad_secret.client_proof(&h.core.cookie_input(&[9; 16], &server_nonce), &cookie),
+        };
+        assert!(
+            h.exchange(&Envelope::client(0, 2, LAG_UNKNOWN, vec![bad_echo]))
+                .is_none()
+        );
+        assert_eq!(h.core.session_count(), 1);
+        assert_eq!(h.core.active_session(), Some(owner));
+        assert!(h.core.take_actions().is_empty());
+        // Authentication is also checked on a completed-handshake cache hit.
+        let body = *h.core.handshakes.keys().next().unwrap();
+        let mut echo = h.echo(
+            body[..16].try_into().unwrap(),
+            body[16..32].try_into().unwrap(),
+            body[32..].try_into().unwrap(),
+        );
+        let Frame::CookieEcho { proof, .. } = &mut echo else {
+            panic!()
+        };
+        proof[0] ^= 1;
+        assert!(
+            h.exchange(&Envelope::client(0, 3, LAG_UNKNOWN, vec![echo]))
+                .is_none()
+        );
+        assert_eq!(h.core.active_session(), Some(owner));
+    }
+
+    #[test]
+    fn duplicate_exchanges_replay_ciphertext_and_expired_cache_never_reencrypts() {
+        let mut h = Harness::new();
+        let sid = h.establish();
+        let keys = h.crypto[&sid].clone();
+        let env = Envelope::client(sid, 1, LAG_UNKNOWN, vec![open_frame(1)]);
+        let mut bytes = env.encode();
+        keys.apply(&mut bytes, Direction::ClientToServer).unwrap();
+        assert_eq!(bytes.len(), env.encoded_len());
+        let query = build_query(1, &bytes, &h.domain).unwrap();
+        let first = h
+            .core
+            .handle_datagram(h.src, &query.packet, h.t0, UNIX)
+            .unwrap();
+        // Different query content under the same exchange cannot produce a
+        // different encrypted response, even if new destination work is queued.
+        let mut altered = Envelope::client(sid, 1, LAG_UNKNOWN, vec![]).encode();
+        keys.apply(&mut altered, Direction::ClientToServer).unwrap();
+        let altered = build_query(2, &altered, &h.domain).unwrap();
+        let duplicate = h
+            .core
+            .handle_datagram(h.src, &altered.packet, h.t0, UNIX)
+            .unwrap();
+        assert_eq!(
+            dns::parse_response(&first, &query.qname).unwrap(),
+            dns::parse_response(&duplicate, &altered.qname).unwrap()
+        );
+        assert!(
+            h.core
+                .handle_datagram(
+                    h.src,
+                    &query.packet,
+                    h.t0 + RESPONSE_CACHE_AGE,
+                    UNIX + RESPONSE_CACHE_AGE.as_secs()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn without_reverse_multiple_clients_remain_supported() {
+        let mut h = Harness::new();
+        h.establish();
+        h.establish();
+        assert_eq!(h.core.session_count(), 2);
+        assert_eq!(h.core.active_session(), None);
     }
 
     #[test]
@@ -1161,11 +1504,7 @@ mod tests {
         else {
             panic!()
         };
-        let echo = Frame::CookieEcho {
-            client_nonce: cn,
-            server_nonce,
-            cookie,
-        };
+        let echo = h.echo(cn, server_nonce, cookie);
         let first = h
             .exchange(&Envelope::client(0, 2, LAG_UNKNOWN, vec![echo.clone()]))
             .unwrap();
@@ -1183,11 +1522,7 @@ mod tests {
         // Tampered cookie with cached nonces, and exact expiry.
         let mut bad = cookie;
         bad[19] ^= 1;
-        let tampered = Frame::CookieEcho {
-            client_nonce: cn,
-            server_nonce,
-            cookie: bad,
-        };
+        let tampered = h.echo(cn, server_nonce, bad);
         let expired = vec![Frame::SessionError {
             reason: session_error::HANDSHAKE_EXPIRED,
         }];
@@ -1231,11 +1566,7 @@ mod tests {
             else {
                 panic!()
             };
-            echoes.push(Frame::CookieEcho {
-                client_nonce: [i; 16],
-                server_nonce,
-                cookie,
-            });
+            echoes.push(h.echo([i; 16], server_nonce, cookie));
         }
         let first = h
             .exchange(&Envelope::client(
@@ -1277,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_and_version_errors_are_xored() {
+    fn unknown_session_and_version_errors_are_public_and_rate_limited() {
         let mut h = Harness::new();
         let reply = h.exchange(&Envelope::client(0xdead, 9, 1, vec![])).unwrap();
         assert_eq!(
@@ -1287,17 +1618,15 @@ mod tests {
             }]
         );
         assert_eq!((reply.session_id, reply.exchange_id), (0xdead, 9));
-        // Version 2 header: SESSION_ERROR(unsupported version).
+        // Version 1 header: SESSION_ERROR(unsupported version).
         let mut bytes = Envelope::client(0xdead, 9, 1, vec![]).encode();
-        bytes[0] = 0x40;
-        h.key.apply(&mut bytes);
+        bytes[0] = 0x20;
         let query = build_query(1, &bytes, &h.domain).unwrap();
         let packet = h
             .core
             .handle_datagram(h.src, &query.packet, h.t0, UNIX)
             .unwrap();
-        let mut payload = dns::parse_response(&packet, &query.qname).unwrap();
-        h.key.apply(&mut payload);
+        let payload = dns::parse_response(&packet, &query.qname).unwrap();
         let env = Envelope::decode(&payload, Direction::ServerToClient).unwrap();
         assert_eq!(
             env.frames,

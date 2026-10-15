@@ -1,6 +1,8 @@
 # Cloudyday design
 
-Status: v1 design, implemented in `src/`. Internal limits and timing
+Status: v2 design with shared-secret authentication and zero-expansion ChaCha20,
+including a server-controlled reverse-SOCKS extension, implemented
+in `src/`. Internal limits and timing
 constants below are starting points to validate in tests, not user-facing knobs.
 
 ## 1. Goal and scope
@@ -18,10 +20,12 @@ Application <- local SOCKS5 <- DNS responses <- recursive resolver
 One executable, with `client` and `server` subcommands:
 
 - SOCKS5 CONNECT only; IPv4, IPv6, and domain-name destinations.
-- Resolve domain-name destinations on the server.
+- Resolve domain-name destinations on the server for forward streams, and on
+  the client for reverse streams.
 - One client resolver, one delegated tunnel domain, multiple TCP connections.
-- Required repeating-key XOR obfuscation; no plaintext mode.
-- No client/server authentication or envelope integrity protection.
+- Shared-secret authentication of both peers during the handshake.
+- Plain ChaCha20 encryption of session bodies, with zero per-envelope expansion.
+- No per-envelope integrity protection or forward secrecy; use TLS inside the tunnel.
 - Server refuses loopback, private, and other internal destinations by default.
 - No TUN, SOCKS4, SOCKS UDP/BIND, local DNS listener, compression, multipath,
   resolver discovery, upstream proxy chaining, or MasterDnsVPN compatibility.
@@ -29,17 +33,20 @@ One executable, with `client` and `server` subcommands:
 ## 2. CLI and operational defaults
 
 ```sh
-cloudyday server --domain t.example.com --listen 0.0.0.0:53 --xor-key-file /path/to/key
-cloudyday client --domain t.example.com --resolver 192.0.2.53:53 --xor-key-file /path/to/key
+cloudyday server --domain t.example.com --listen 0.0.0.0:53 --key-file /path/to/secret
+cloudyday client --domain t.example.com --resolver 192.0.2.53:53 --key-file /path/to/secret
 
-# Both sides require the same nonempty XOR key file.
+# Both sides require the same raw high-entropy shared secret (at least 32 bytes).
+# Default: shared.key. The server generates 32 random bytes if missing; the
+# client never generates a secret. Explicit paths must already exist.
 
 # Server only, off by default:
 # --allow-private-destinations
+# --reverse-socks [ADDR]  (default ADDR: 127.0.0.1:1080)
 ```
 
 Client SOCKS listen address defaults to `127.0.0.1:1080`, overridable with
-`--listen`. No local SOCKS authentication in v1; binding to a non-loopback
+`--listen`. No local SOCKS authentication; binding to a non-loopback
 address produces a warning. Verbosity is the only other initial CLI setting.
 
 By default the server refuses destinations in loopback, unspecified,
@@ -53,21 +60,51 @@ SOCKS status `0x02` (connection not allowed by ruleset).
 `--allow-private-destinations` disables this filter for deliberate use, such as
 reaching services on the server's own network.
 
-No configuration file or exposed ARQ/worker/queue tuning in v1. Read the required
-XOR key file as nonempty raw bytes, without trimming. Reject missing or empty
-keys and other invalid configuration at startup; never log key material,
-cookies, or tunneled content.
+No configuration file or exposed ARQ/worker/queue tuning. Read the shared secret
+as raw bytes, without trimming. Reject missing secrets or files shorter than
+32 bytes. Generate secrets from OS randomness, not passwords: proofs permit
+offline guesses. Never log secrets, session keys, cookies, proofs, or tunneled
+content. Upgrade both endpoints together and generate a fresh secret rather
+than reusing an old XOR key. The legacy --xor-key-file alias does not enable XOR.
 
 The domain must be delegated to the server, whose UDP DNS port must be reachable
 by the resolver. This is a TCP proxy, not an IP VPN. The server is not a generic
 recursive DNS service and never forwards arbitrary incoming DNS questions; it
 answers non-tunnel questions as a minimal authoritative server (§7.4).
 
-Always warn at startup that the tunnel has no authentication and XOR is not
-access control. Treat the server as an open proxy: an observer can recover a
-repeating key and forge traffic. Apply resource limits. XOR is obfuscation, not
-secure encryption; users needing confidentiality should use application-level
-TLS. Application TLS does not restrict who can use the proxy.
+Warn at startup that authentication is handshake-only. Plain ChaCha20 has no
+message integrity: active attackers can modify ciphertext, spoof public errors,
+or disrupt sessions. Traffic metadata is visible and there is no forward secrecy.
+Use application-level TLS for active-attack resistance. Apply resource limits;
+local SOCKS listeners still have no user authentication.
+
+### 2.1 Reverse SOCKS extension
+
+`--reverse-socks [ADDR]` is server-only and off by default. Once a client
+establishes a session, the server binds the configured SOCKS5 listener (default
+`127.0.0.1:1080`). Applications there are tunneled back to the client, which
+resolves names and dials destinations. The normal forward proxy remains usable.
+Clients always support this extension and establish sessions at startup, without
+waiting for a local SOCKS CONNECT.
+
+In reverse mode, only one established session is retained. A newly accepted
+COOKIE_ECHO replaces the previous session and closes its TCP bridges. Cached
+handshake retries never replace ownership; a retry belonging to a replaced
+session receives SESSION_ERROR(replaced). Recently replaced session IDs are
+retained for 60 seconds (bounded to 256) so their polls receive the same error.
+The displaced client fails its streams and stops automatic reconnection until
+restarted, avoiding a takeover loop. Ordinary session loss still reconnects
+automatically. The listener is removed when its owner expires; a bind failure
+terminates the server. SOCKS negotiations and events are tagged with their
+owner at TCP accept time, so they cannot migrate to a replacement client.
+
+The client deliberately permits private and loopback destinations for reverse
+SOCKS. The server's `--allow-private-destinations` affects only forward streams.
+Trust the server: connecting a client grants access to its network, and the
+handshake authenticates peers, but untagged traffic remains malleable.
+Non-loopback SOCKS binds warn as usual.
+Use updated binaries on both sides for this extension; no capability or mode
+field is negotiated in the handshake.
 
 ## 3. Rust architecture
 
@@ -76,7 +113,8 @@ Use Tokio for networking, bounded channels, and cancellation. Suggested modules:
 | Module | Responsibility |
 | --- | --- |
 | `cli` | Arguments, key loading, startup, logging |
-| `wire` | Bounded binary parsing, framing, XOR, server-cookie HMAC |
+| `wire` | Bounded binary parsing, framing, server-cookie HMAC |
+| `crypto` | Shared-secret proofs, HKDF session keys, plain ChaCha20 |
 | `dns` | DNS encoding/parsing, query tracking, payload budgets, non-tunnel answers |
 | `arq` | Pure selective-repeat state machine and retransmission deadlines |
 | `session` | Handshake, stream lifecycle, flow control, scheduling, polling |
@@ -94,7 +132,7 @@ rather than a task or periodic timer per packet.
 Use an established DNS wire library rather than writing a general DNS parser.
 Keep dependencies modest: Tokio, clap, bytes, tracing, a DNS wire library,
 base32 support, OS randomness, and HMAC-SHA256 support for stateless server
-cookies only (not peer authentication or envelope tags).
+cookies and handshake proofs, HKDF-SHA256, and RustCrypto ChaCha20 (no envelope tags).
 
 ## 4. Wire format sketch
 
@@ -123,12 +161,14 @@ Flags:
 
 | Flag | Meaning |
 | --- | --- |
+| PLAIN_ERROR | Server to client: exactly one public SESSION_ERROR; no encryption |
 | MORE_PENDING | Server to client: more frames are queued for this session |
 
 Frames run until the end of the envelope; there is no frame count or
 authentication tag. An envelope with no frames is valid: from the client it is a
 poll or keepalive, and from the server it means nothing is pending. Every
-envelope is XORed before DNS encoding (§8).
+established envelope's body is encrypted before DNS encoding (§8); its existing
+nine-byte routing prefix, handshake envelopes, and marked errors remain public.
 
 Handshake envelopes use session ID zero until ACCEPT. Session IDs are random
 nonzero 32-bit values; they identify state, not credentials. The client assigns
@@ -139,8 +179,10 @@ the client has received in this session, saturating at 255; it lets the server
 detect lost responses (§5). The value 255 also represents no response received
 and supplies no positive evidence of response delivery.
 
-Stream IDs are client-assigned monotonically increasing `u32` values, never
-reused within a session. Each direction has independent `u32` sequence numbers.
+Forward stream IDs are client-assigned monotonically increasing values starting
+at 1, with the high bit clear. Reverse stream IDs are server-assigned and start
+at `0x80000000`, with the high bit set. Neither range is reused within a session.
+Each direction has independent `u32` sequence numbers.
 Do not wrap counters: establish a new session or reset an exhausted stream or
 exchange counter.
 
@@ -176,9 +218,11 @@ SACKed sequences. SACK bits are relative to each incoming ACK's own
 unsent sequences or overflow sequence/credit arithmetic. A.7 includes reordered
 ACK and lost-credit-update traces.
 
-A direction's first bytes form a bounded opening record: the client sends OPEN
-with the SOCKS address type, address, and port; the server sends an OPEN_RESULT
-with a SOCKS-compatible status and bound address. These records travel through
+A direction's first bytes form a bounded opening record: the initiator sends
+OPEN with the SOCKS address type, address, and port; the dialer sends an
+OPEN_RESULT with a SOCKS-compatible status and bound address. For forward
+streams these roles are client and server; for reverse streams they are server
+and client. These records travel through
 ordinary sequenced SEGMENTs, so long hostnames can span several DNS queries
 without a separate fragmentation protocol. The receiver consumes the opening
 record before interpreting subsequent bytes as application data. Cap the record
@@ -306,11 +350,13 @@ new destination connection.
 Session loss must be detected promptly rather than inferred from stream stalls:
 
 - The server answers a well-formed tunnel query for an unknown session ID with
-  SESSION_ERROR(unknown session), XORed with the configured key like every other
-  envelope. This error, like all traffic, is unauthenticated and can be forged
+  public SESSION_ERROR(unknown session) with the PLAIN_ERROR flag. This error
+  is unauthenticated and can be forged
   by a capable attacker. Rate-limit these replies per resolver address.
 - On SESSION_ERROR(unknown session), the client fails the session's streams
-  immediately and establishes a new session on demand.
+  immediately and automatically establishes a new session.
+- On SESSION_ERROR(replaced), the client fails its streams and does not retry
+  until restarted.
 - The client also declares the session dead after 60 seconds without any valid
   response, matching server expiry, and handles it the same way.
 
@@ -318,13 +364,14 @@ Session loss must be detected promptly rather than inferred from stream stalls:
 
 ### 7.1 Encoding
 
-Use UDP DNS TXT questions. XOR the serialized envelope, then encode it as
-unpadded lowercase base32 labels, each at most 63 characters, followed by the
-tunnel domain. Decode names case-insensitively because resolvers may change case,
-then remove XOR before parsing the envelope.
+Use UDP DNS TXT questions. Encrypt the established envelope body (§8), then
+encode the complete wire envelope as unpadded lowercase base32 labels, each at
+most 63 characters, followed by the tunnel domain. Decode case-insensitively
+because resolvers may change case; use public routing fields to select session
+keys, then decrypt before parsing frames. Handshakes and marked errors are public.
 
 A tunnel response carries exactly one TXT resource record whose character
-strings, concatenated in order, form the XORed binary envelope. Never split an
+strings, concatenated in order, form the wire envelope. Never split an
 envelope across several TXT records: resolvers may reorder the records in a set
 or remove duplicates, but they preserve string order within one record.
 
@@ -332,15 +379,14 @@ Set answer TTL to zero, but do not rely on caches honoring it: fresh exchange ID
 make every query name unique. The server always responds promptly, even when
 there is no download data. It never sends unsolicited DNS responses. Holding a
 query briefly on the server until download data is ready (long polling) would
-cut latency and idle query rate. It is a candidate follow-up after v1
-measurements, not part of v1.
+cut latency and idle query rate. It is a candidate follow-up, not implemented.
 
 ### 7.2 Payload budget and segment sizes
 
 Keep complete responses within 512 bytes initially. Budget the actual encoded
 question, DNS header, answer record overhead, the server's own OPT record when
 the query carried one, and TXT length octets; never assume the whole 512 bytes
-is tunnel payload. XOR preserves length and there are no authentication tags.
+is tunnel payload. Plain ChaCha20 preserves length and there are no authentication tags.
 Query names must fit the 255-byte wire-name limit. Reject domains leaving
 insufficient room for the largest handshake message or a segment with at least
 16 payload bytes.
@@ -370,7 +416,7 @@ Worked example for `t.example.com` (15 wire bytes):
 | SEGMENTs of size D per poll response | 2 |
 
 No MTU probing, EDNS size negotiation, IP fragmentation dependence, or
-DNS-over-TCP fallback in v1.
+DNS-over-TCP fallback.
 
 ### 7.3 Duplicate queries and the response cache
 
@@ -391,13 +437,13 @@ envelope:
   window, is dropped without a response.
 - An unseen exchange ID inside the window is processed normally; queries may
   arrive out of order.
-- Cache envelopes, not DNS messages. Each copy of a query may carry a different
+- Cache encrypted envelopes, not DNS messages. Never regenerate a different
+  response under a previously used direction/session/exchange key and nonce. Each copy of a query may carry a different
   DNS transaction ID, question-name case, or EDNS option, so the DNS wrapper is
   rebuilt for every reply.
 - Validate envelope structure before consulting the cache. This is duplicate
-  suppression, not security replay protection: without authentication a forged
-  query can retrieve cached data or inject new frames if the attacker learns
-  the XOR key and session identifiers.
+  suppression, not cryptographic integrity or security replay protection.
+  Packets have no tag; active attackers may tamper with a live session.
 
 ### 7.4 Non-tunnel queries
 
@@ -454,8 +500,8 @@ Repeated empty responses back off in stages:
 | Over 60 seconds | 15 seconds |
 
 Any local upload data, received download data, or MORE_PENDING returns the
-client to active polling. With no streams, send a keepalive every 15 seconds,
-well inside the 60-second server session expiry. The cost of this backoff is
+client to active polling. With no forward streams, poll every second to discover
+server-initiated reverse opens, well inside the 60-second server session expiry. The cost of this backoff is
 latency for data the server initiates on a quiet connection: up to 15 seconds
 in the slowest stage. Long polling (§7.1) would remove it.
 
@@ -470,40 +516,61 @@ session ID, and exchange ID against outstanding queries. Discard unsolicited,
 late-completed, malformed, truncated, and mismatched responses. DNS failure or
 query timeout does not imply stream delivery failure: ARQ owns stream recovery.
 
-## 8. XOR and unauthenticated session establishment
+## 8. Shared-secret authentication and plain ChaCha20
 
-V1 has one operating mode: repeating-key XOR, with no client/server
-authentication, envelope MAC, or plaintext fallback. Both sides require the same
-nonempty XOR key file. There is no mode negotiation or token option.
+V2 requires at least 32 raw, high-entropy shared-secret bytes. There is no XOR
+mode, version downgrade, or unencrypted established-traffic fallback. Both
+endpoints must be upgraded. Never reuse a secret exposed by the v1 XOR protocol.
 
-XOR every serialized envelope with the repeating key bytes before DNS encoding,
-restarting at key offset zero for every envelope in either direction. Reverse
-XOR before parsing. DNS headers, question metadata, TXT length octets, and other
-DNS framing are not XORed. A key mismatch normally produces undecodable traffic
-or failed validation; without authentication it cannot be detected reliably.
-Never retry using plaintext. XOR is not encryption or access control: known
-headers reveal key bytes, and a capable attacker can read, modify, inject, or
-terminate traffic. Use application TLS for sensitive data.
+1. HELLO supplies a fresh random 128-bit client nonce.
+2. CHALLENGE supplies a fresh server nonce, fixed U/D, and a short-lived cookie.
+   The cookie uses an independent random server-only key and defers allocation.
+3. COOKIE_ECHO returns both nonces, cookie, and a 32-byte HMAC-SHA256 client proof.
+   Verify cookie and proof before cache lookup, session allocation, destination
+   dialing, or reverse-SOCKS takeover. Invalid proofs are silently dropped.
+4. ACCEPT supplies a random nonzero session ID and a 32-byte server proof.
+   The client verifies the proof before establishing a session or reverse dialing.
+   Cached retries return the same session/proof under the current exchange ID.
 
-Keep a stateless cookie exchange to defer session allocation until the client
-returns a server-issued challenge:
+Exact authentication and key derivation use this unambiguous transcript:
 
-1. HELLO supplies a random 128-bit client nonce.
-2. CHALLENGE supplies a server nonce, fixed transport parameters, and a
-   short-lived cookie. Bind the cookie to both nonces, expiry, version, domain,
-   and transport parameters using a random server-only secret. It is not bound
-   to UDP source address because recursive resolver paths may change. No
-   destination connections or durable session state are created yet.
-3. COOKIE_ECHO returns both nonces and the cookie. Anyone who obtains a valid
-   challenge can complete this step; it proves neither identity nor permission.
-4. ACCEPT assigns a random session ID. Cache the completed handshake so retries
-   return that same session, rebuilding the response for each retry's exchange
-   ID (A.4).
+```text
+T(session) = version:u8 || domain_wire || client_nonce:[16] || server_nonce:[16]
+             || U:u16 || D:u16 || cookie:[20] || session:u32
+client_proof = HMAC-SHA256(PSK, b"cloudyday v2 client proof" || T(0))
+server_proof = HMAC-SHA256(PSK, b"cloudyday v2 server proof" || T(assigned_session))
+salt = SHA256(T(assigned_session))
+PRK = HKDF-Extract-SHA256(salt, PSK)
+C2S_key = HKDF-Expand-SHA256(PRK, b"cloudyday v2 client to server", 32)
+S2C_key = HKDF-Expand-SHA256(PRK, b"cloudyday v2 server to client", 32)
+```
 
-HMAC-SHA256 is used only to prevent fabrication of server cookies, not to
-authenticate peers or protect envelopes. The server-only cookie secret is
-independent of the shared XOR key. Expire cookies, bound handshake rate and cache
-size, and generate nonces and server secrets using OS randomness.
+Labels have no terminator. Verify proofs in constant time. The public proofs
+are never used as keys. Domain, version, both nonces, transport parameters,
+cookie, role, and assigned session are bound to the keys or corresponding proof.
+
+Established envelopes retain their existing first nine bytes (version/flags,
+session ID, exchange ID). Encrypt all remaining bytes with IETF ChaCha20 using
+the appropriate directional key, block counter zero, and this 96-bit nonce:
+
+```text
+00000000 || session_id:u32 (BE) || exchange_id:u32 (BE)
+```
+
+The nonce is not transmitted separately. Encrypt client rx_lag and all frames,
+including OPEN and OPEN_RESULT. DNS wrappers, TXT length octets, routing fields,
+handshakes, and flagged public errors are not encrypted. No padding, tag, or
+other per-envelope bytes are added. Never wrap exchange IDs. A session's keys
+must not be reused across a new handshake. Cache response ciphertext exactly;
+a duplicate must not encrypt different data with an already-used nonce. Drop
+duplicates whose cached response has expired rather than regenerating them.
+
+Authentication occurs only during establishment. Plain ChaCha20 is malleable:
+active attackers can modify ciphertext and headers, forge public errors, and
+terminate or interfere with sessions. Replay/structure checks are not integrity
+checks. There is no forward secrecy: compromise of the PSK and a recorded
+handshake exposes that session's keys. Proofs allow offline password guesses;
+use random secrets. Use TLS for active-attack resistance inside the tunnel.
 
 ## 9. Resource limits and diagnostics
 
@@ -515,11 +582,11 @@ allocation and return bounded errors. Limits may change after tests, without
 becoming CLI options by default.
 
 Expose concise logs for session establishment/loss, connection failures,
-unauthenticated XOR operation, and resource exhaustion. Debug logs may include
+handshake authentication failures, absent packet integrity, and resource exhaustion. Debug logs may include
 counters, RTT/RTO, queue occupancy, retransmissions, and query failures, but not
 payloads or secrets. Log refused destinations at debug level. This deployment
-remains an intentional open proxy; resource limits and XOR do not provide access
-control. The destination filter (§2) limits where that proxy can reach.
+authenticates shared-secret holders at the handshake, not local SOCKS users or
+individual packets. The destination filter (§2) limits forward destinations.
 
 ## 10. Implementation and verification order
 
@@ -530,7 +597,8 @@ control. The destination filter (§2) limits where that proxy can reach.
    and counter exhaustion.
 3. Add DNS framing, segment-size and payload-budget tests, non-tunnel query
    answers, the response cache, and a local client/server round trip.
-4. Add the cookie handshake, duplicate/replay handling, and required XOR.
+4. Add cookie/proof authentication, HKDF keys, zero-expansion ChaCha20, and exact
+   ciphertext replay handling.
 5. Add SOCKS CONNECT, name resolution, the destination filter, opening errors,
    and TCP half-close.
 6. Exercise concurrent streams, adaptive pipeline depth, idle polling backoff,
@@ -539,8 +607,8 @@ control. The destination filter (§2) limits where that proxy can reach.
 Acceptance tests must demonstrate: exact byte delivery; no duplicate destination
 connections; one lossy stream not blocking unrelated streams; bounded memory
 under slow readers; correct FIN handling; explicit failure after session loss;
-XOR on every envelope, including handshake/error responses; rejection of missing
-or empty keys, and no plaintext fallback; no response stranded by duplicate
+handshake proof verification, unchanged encrypted envelope lengths, independent
+directional/session keys, rejection of missing/short secrets, and no downgrade; no response stranded by duplicate
 queries; refusal of internal destinations, including through a hostile DNS
 answer; and
 operation through real recursive resolvers. Include Unbound and BIND with query
@@ -577,17 +645,17 @@ Required regression cases for the state invariants:
 
 ## Appendix A. Wire specification
 
-This appendix freezes the byte-level details for protocol version 1. Where it
+This appendix freezes the byte-level details for protocol version 2. Where it
 is more specific than the main text, it governs. Everything here is
 interoperability-relevant unless marked local.
 
 ### A.1 Conventions
 
 - All integers are unsigned and big-endian.
-- Protocol version is 1. `ver_flags` carries the version in bits 7–5 and flags in
-  bits 4–0, so a version 1 envelope with no flags has `ver_flags = 0x20`.
+- Protocol version is 2. `ver_flags` carries the version in bits 7–5 and flags in
+  bits 4–0, so a v2 envelope without flags has `ver_flags = 0x40`.
 - The server-cookie HMAC label is the ASCII byte string
-  `b"cloudyday v1 cookie"`, with no terminator.
+  `b"cloudyday v2 cookie"`, with no terminator.
 - `domain_wire` is the tunnel domain in DNS wire format, lowercased, ending
   with the root label. For `t.example.com`, that is
   `01 74 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00`.
@@ -598,7 +666,7 @@ interoperability-relevant unless marked local.
 
 - Header: random 16-bit ID from the OS RNG for every query; flags `0x0100`
   (RD set, all else clear); QDCOUNT 1, ANCOUNT 0, NSCOUNT 0, ARCOUNT 1.
-- Question: QNAME is the base32 XORed-envelope labels followed by the tunnel domain;
+- Question: QNAME is the base32 wire-envelope labels followed by the tunnel domain;
   QTYPE TXT (16); QCLASS IN (1).
 - Additional: an OPT record with UDP payload size 1232, extended RCODE 0,
   version 0, DO clear, and no options. This gives the resolver room for
@@ -625,7 +693,7 @@ interoperability-relevant unless marked local.
   query had an OPT record, otherwise 0.
 - Question: the query's question section, copied byte for byte.
 - Answer: NAME `c0 0c` (pointer to the question name), TYPE TXT, CLASS IN,
-  TTL 0, then RDATA holding the XORed envelope as consecutive character strings of
+  TTL 0, then RDATA holding the wire envelope as consecutive character strings of
   255 bytes, with the last string holding 1–255 bytes.
 - Additional, if the query had an OPT record: OPT with UDP payload size 1232,
   zero TTL fields, and no options.
@@ -639,11 +707,12 @@ interoperability-relevant unless marked local.
   REFRESH 3600, RETRY 600, EXPIRE 86400, MINIMUM 0, and TTL 0.
 - A query counts as a decodable tunnel query when all of the following hold:
   QTYPE is TXT, QCLASS is IN, the name lies under the tunnel domain with
-  canonical base32 labels, the decoded and de-XORed envelope is at least as long
-  as the client header, and the version is 1.
+  canonical base32 labels and a decoded wire envelope at least as long as the
+  client header, with a nonzero exchange and version 2. Select session keys from
+  its public routing prefix before parsing encrypted bodies.
 - A query that meets every condition except the version gets
-  SESSION_ERROR(unsupported version). Anything else that fails these checks
-  gets NODATA.
+  public SESSION_ERROR(unsupported version). Non-tunnel names get NODATA;
+  malformed tunnel envelopes and invalid proofs can be dropped silently.
 
 **Client response checks.** The response must:
 
@@ -675,8 +744,9 @@ question's letter case exactly.
 
 | Bit | Mask | Name | Notes |
 | --- | --- | --- | --- |
+| 0 | 0x01 | PLAIN_ERROR | Public, unencrypted, exactly one SESSION_ERROR; server only |
 | 1 | 0x02 | MORE_PENDING | Valid only from the server |
-| 0, 2–4 | 0x1d | reserved | Must be zero; reject envelopes that set them |
+| 2–4 | 0x1c | reserved | Must be zero; reject envelopes that set them |
 
 **Exchange IDs**
 
@@ -694,12 +764,13 @@ question's letter case exactly.
   recovery remain enabled. Zero is invalid; an exact lag must be less than the
   query's exchange ID, since session response IDs start at 1.
 
-**XOR.** Byte `i` of the complete envelope, counted from `ver_flags`, is XORed
-with `key[i mod key_len]`. This is required for every envelope in both directions,
-including handshake and SESSION_ERROR. There is no authentication tag. Senders
-serialize, XOR, then encode in DNS; receivers decode DNS, remove XOR, then parse
-and validate. The key offset restarts at zero for each envelope, not each frame,
-label, or TXT character string.
+**Encryption.** See §8 for exact ChaCha20 key/nonce construction. Session bytes
+at offsets 9 onward are encrypted as one continuous stream before DNS encoding;
+never restart at frame, label, or TXT boundaries. The first nine bytes remain
+public. Handshakes (session ID zero) and PLAIN_ERROR envelopes are public. Reject
+the PLAIN_ERROR flag unless the envelope is a lone server SESSION_ERROR; reject
+SESSION_ERROR without it. Public errors are untrusted and may cause teardown,
+backoff, or handshake restart, but never authorize a session or destination dial.
 
 **Frames.** Each frame is `kind: u8 | length: u8 | body`. Frames repeat until
 the end of the envelope. A frame whose length runs past that point, or an unknown
@@ -722,7 +793,7 @@ kind, invalidates the whole envelope.
 - A handshake envelope (`session_id` 0) carries exactly one handshake frame,
   or a SESSION_ERROR as specified below.
 - SESSION_ERROR travels alone in an envelope that echoes the query's
-  `session_id` and `exchange_id`; XOR still applies.
+  `session_id` and `exchange_id`, with PLAIN_ERROR set and no encryption.
 - All other frames appear only in post-handshake envelopes.
 - A STREAM_ACK describes the direction of the stream that its sender
   receives.
@@ -744,23 +815,25 @@ kind, invalidates the whole envelope.
 
 | Code | Meaning | Client action |
 | --- | --- | --- |
-| 0x01 | Unknown session | Fail the session's streams; establish a new session on demand |
+| 0x01 | Unknown session | Fail the session's streams; automatically establish a new session |
 | 0x02 | Unsupported version | Fail with a version error; do not retry |
 | 0x03 | Server busy | Fail pending opens; wait at least 5 s before another handshake |
 | 0x04–0x05 | Reserved | Reject as an unknown error code |
 | 0x06 | Handshake expired | Restart the handshake with a fresh HELLO |
+| 0x07 | Replaced by newer client (reverse SOCKS) | Fail streams; do not retry until restarted |
 
 ### A.4 Handshake
 
-There is no mode field, token proof, or session MAC key. Every handshake envelope
-uses session ID zero, including ACCEPT; its body supplies the new session ID.
+Every handshake envelope is public and uses session ID zero, including ACCEPT;
+its body supplies the new session ID. There is no mode negotiation or packet MAC.
+Authentication proofs and session keys are specified exactly in §8.
 
 | Frame | Body | Size |
 | --- | --- | --- |
 | HELLO | `client_nonce: [16]` | 16 |
 | CHALLENGE | `server_nonce: [16] \| U: u16 \| D: u16 \| cookie: [20]` | 40 |
-| COOKIE_ECHO | `client_nonce: [16] \| server_nonce: [16] \| cookie: [20]` | 52 |
-| ACCEPT | `session_id: u32` | 4 |
+| COOKIE_ECHO | `client_nonce: [16] \| server_nonce: [16] \| cookie: [20] \| proof: [32]` | 84 |
+| ACCEPT | `session_id: u32 \| proof: [32]` | 36 |
 
 **Server side**
 
@@ -769,20 +842,25 @@ uses session ID zero, including ACCEPT; its body supplies the new session ID.
   §7.2, and a cookie. The server keeps no state for the HELLO.
 - **Cookie (local construction).** The cookie is opaque to the client. The
   recommended form is `expiry: u32 (Unix seconds) ||
-  HMAC-SHA256(server_secret, b"cloudyday v1 cookie" || version: u8 ||
+  HMAC-SHA256(server_secret, b"cloudyday v2 cookie" || version: u8 ||
   domain_wire || client_nonce || server_nonce || expiry: u32 || U: u16 || D: u16)[0..16]`.
   `server_secret` is 32 random bytes generated at startup, independent of the
-  XOR key. Compare the cookie MAC in constant time. At `now >= expiry`, the
+  shared secret. Compare the cookie MAC in constant time. At `now >= expiry`, the
   cookie is expired.
 - **COOKIE_ECHO.** Verify the cookie and expiry before consulting the handshake
-  cache; failure returns SESSION_ERROR(handshake expired). Look up the cache by
+  cache; failure returns public SESSION_ERROR(handshake expired). Verify the
+  client proof in constant time, including on cache hits; failure is silently
+  dropped without allocation or takeover. Look up the cache by
   the full `(client_nonce, server_nonce, cookie)` tuple under the current domain,
   version, and transport parameters. On a cache hit, reuse the assigned session
-  ID, but rebuild ACCEPT with the current query's exchange ID and apply XOR.
-  Never reuse an envelope carrying an earlier exchange ID. On a cache miss:
+  ID and server proof, but rebuild public ACCEPT with the current query's exchange ID.
+  In reverse mode, if that session was replaced, return SESSION_ERROR(replaced)
+  instead; a cached retry must never reclaim ownership. Never reuse an envelope
+  carrying an earlier exchange ID. On a cache miss:
   - recheck capacity; if full, reply SESSION_ERROR(busy);
   - assign a random nonzero session ID not in use;
-  - store the assignment and send ACCEPT.
+  - derive fresh directional session keys, store the assignment, and send ACCEPT
+    with a server proof bound to that assignment.
 - Retain completed-handshake entries until their cookies expire. If cache
   capacity is exhausted, refuse new handshakes with SESSION_ERROR(busy) rather
   than evict a live entry and risk allocating twice for a valid cookie retry.
@@ -795,22 +873,25 @@ uses session ID zero, including ACCEPT; its body supplies the new session ID.
   establishment with a configuration error.
 - Retransmit COOKIE_ECHO with an identical body and a fresh exchange ID.
 - Accept ACCEPT only if it matches an outstanding COOKIE_ECHO query and contains
-  a nonzero session ID. There is no cryptographic verification of the server.
+  a nonzero session ID and a valid server proof bound to the current handshake.
+  Derive session keys only after verification. Invalid proofs never authorize
+  reverse dialing.
 
 **Retries (local).**
 
 - Handshake messages time out after 2 s, doubling to at most 8 s per attempt.
 - A handshake has 30 s overall. Only one handshake runs at a time.
 - After a failure, wait at least 5 s before another attempt.
-- If no valid reply arrives at all, report a probable domain, resolver, or XOR
-  key mismatch. Wrong-key traffic is not guaranteed to be distinguishable from
-  other malformed traffic; never fall back to plaintext.
+- If no authenticated session can be established, report a probable domain,
+  resolver, or shared-secret mismatch. Never fall back to XOR or unencrypted
+  established-session traffic.
 
 ### A.5 Streams and opening records
 
 **Stream state**
 
-- Stream IDs start at 1 and increase.
+- Forward stream IDs start at 1 and increase without setting the high bit;
+  reverse stream IDs start at `0x80000000` and increase without wrapping.
 - Sequence numbers start at 0 in each direction.
 - Initial credit is the full window: sequences 0–31 may be sent before any
   STREAM_ACK arrives.
@@ -839,7 +920,11 @@ a FIN at or below already accepted data is a protocol violation: reset the
 stream. Retaining or acknowledging FIN does not consume earlier bytes or shut
 down TCP; apply FIN only after all preceding bytes have been delivered.
 
-**Server stream-ID admission**
+**Dialer stream-ID admission**
+
+The following applies to the server for forward IDs and to the client for
+reverse IDs. Each ID range has its own admission window. An initiator never
+creates a new stream from peer traffic.
 
 Maintain a high-water mark `H`, initially 0, and a used-ID bitmap of width `W`
 (the local reorder allowance, initially 64). The bitmap represents IDs
@@ -897,7 +982,7 @@ except that `atyp` 0x03 is not used.
 **Dialing.** For domain destinations, the server resolves with the system
 resolver and filters every address. It then tries the remaining addresses in
 the order returned, one at a time, each within the remaining open deadline.
-The first success wins. Happy Eyeballs is not used in v1.
+The first success wins. Happy Eyeballs is not used.
 
 **Client SOCKS side**
 
@@ -915,8 +1000,10 @@ version.
 
 | Constant | Value |
 | --- | --- |
-| Version | 1 |
-| Obfuscation; authentication | Required repeating-key XOR; no peer authentication or envelope tag |
+| Version | 2 |
+| Encryption; authentication | Plain ChaCha20 session bodies; HMAC-SHA256 handshake proofs; no packet tag |
+| Shared secret; authentication proof | At least 32 random bytes; 32 bytes |
+| Cipher nonce; initial block counter | Derived 12 bytes, not transmitted; 0 |
 | Receive window and initial credit | 32 frames |
 | SACK map width | 32 bits |
 | Maximum DNS response | 512 bytes |
@@ -938,12 +1025,12 @@ Local constants are starting points that each side may tune independently:
 | Stream ID reorder allowance | 64; used-ID bitmap retained for the session and shifted only as the high-water mark advances |
 | Stall deadline; open deadline | 120 s; 30 s |
 | Session expiry (server); dead timer (client) | 60 s; 60 s |
-| Keepalive; idle poll tiers | 15 s; 1 s / 5 s / 15 s after 0 / 10 / 60 s idle |
+| Idle poll tiers | 1 s with no forward streams; otherwise 1 s / 5 s / 15 s after 0 / 10 / 60 s idle |
 | Exchange window; response cache | 1024 IDs; 256 envelopes or 5 s |
 | Cookie lifetime; handshake cache | 30 s; retain until cookie expiry, at most 256 entries (refuse new entries when full) |
 | Handshake rate | 10 per second, burst 20, for the whole server |
 | SESSION_ERROR rate | 10 per second per resolver address |
-| Limits | 64 streams per session, 64 sessions, 32 MiB of buffering |
+| Limits | 64 combined forward/reverse streams per session, 64 sessions (1 in reverse mode), 32 MiB of server buffering |
 
 ### A.7 Test vectors
 
@@ -952,21 +1039,22 @@ standard library. `python3 tools/gen_vectors.py --check` runs the vector
 assertions and verifies that this section is current. These are codec examples
 and small state-transition oracles, not substitutes for implementation tests.
 
-Unless noted otherwise, use session `0x01020304`, domain `t.example.com`, and
-XOR key `5a a5 3c`. `plain` means serialized bytes before XOR, never plaintext
-on the wire. All query names and DNS packets below include required XOR.
+Unless noted otherwise, use session `0x01020304`, domain `t.example.com`, shared
+secret bytes `00`–`1f`, and the V3 handshake transcript for session keys. `plain`
+is the serialized envelope; `wire` retains its first nine routing bytes and
+ChaCha20-encrypts the remainder. Handshakes and marked errors are public.
 
-**V1: XOR client poll.**
+**V1: ChaCha20 client poll.**
 
 Exchange 5, `rx_lag = 1`, no frames; DNS ID `0x1234`.
 
 ```text
-poll plain: 20 01 02 03 04 00 00 00 05 01
-poll XOR:   7a a4 3e 59 a1 3c 5a a5 39 5b
-poll qname: pksd4wnbhrnkkok3.t.example.com
+poll plain: 40 01 02 03 04 00 00 00 05 01
+poll wire:  40 01 02 03 04 00 00 00 05 19
+poll qname: iaaqeayeaaaaabiz.t.example.com
 DNS query (59 bytes):
-12 34 01 00 00 01 00 00 00 00 00 01 10 70 6b 73
-64 34 77 6e 62 68 72 6e 6b 6b 6f 6b 33 01 74 07
+12 34 01 00 00 01 00 00 00 00 00 01 10 69 61 61
+71 65 61 79 65 61 61 61 61 61 62 69 7a 01 74 07
 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 10 00 01
 00 00 29 04 d0 00 00 00 00 00 00
 ```
@@ -977,44 +1065,49 @@ ACK stream 1: next expected 3, SACK bit 1 (sequence 5), credit limit 33.
 SEGMENT stream 1: sequence 0, payload `hello`. The query spans two labels.
 
 ```text
-mixed plain: 20 01 02 03 04 00 00 00 06 01 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e 10 0d 00 00 00 01 00 00 00 00 68 65 6c 6c 6f
-mixed XOR:   7a a4 3e 59 a1 3c 5a a5 3a 5b b7 32 5a a5 3c 5b a5 3c 5a a6 3c 5a a5 3e 5a bb 2c 57 a5 3c 5a a4 3c 5a a5 3c 32 c0 50 36 ca
-mixed qname: pksd4wnbhrnkkos3w4zfvjj4lostywvghrnkkps2xmwfpjj4lksdywvfhqzmaub.wzi.t.example.com
+mixed plain: 40 01 02 03 04 00 00 00 06 01 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e 10 0d 00 00 00 01 00 00 00 00 68 65 6c 6c 6f
+mixed wire:  40 01 02 03 04 00 00 00 06 b6 5b ad 27 69 06 26 4c c9 4e 08 2e 8a 04 d6 f3 d1 ba dc d1 c4 e5 71 f1 20 ad d2 d5 f2 a7 69 56
+mixed qname: iaaqeayeaaaaabvwlowso2igezgmstqif2fajvxt2g5nzuoe4vy7cifn2lk7fj3.jky.t.example.com
 ```
 
-**V3: cookie handshake, no peer authentication.**
+**V3: authenticated shared-secret handshake.**
 
 All envelope session IDs are zero; ACCEPT assigns `0x01020304`. Use the
 recommended cookie construction with server secret bytes `00`–`1f`, client
 nonce `00`–`0f`, server nonce `10`–`1f`, expiry 1700000030, and U=111, D=182.
-The cookie HMAC is server-only; no envelope carries a MAC or token proof.
+COOKIE_ECHO authenticates the client; ACCEPT authenticates the server and
+assigned session. HKDF-SHA256 derives separate direction keys from the secret.
 
 ```text
-cookie: 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57
-HELLO plain: 20 00 00 00 00 00 00 00 01 ff 01 10 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
-HELLO XOR:   7a a5 3c 5a a5 3c 5a a5 3d a5 a4 2c 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55
-CHALLENGE plain: 20 00 00 00 00 00 00 00 01 02 28 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 00 6f 00 b6 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57
-CHALLENGE XOR:   7a a5 3c 5a a5 3c 5a a5 3d 58 8d 2c 4b b7 2f 4e b0 2a 4d bd 25 40 be 20 47 bb 23 5a ca 3c ec c0 6f ab bb ac 2d 17 4b fa 0e eb 9a 46 dd 4f f0 f8 63 94 6b
-COOKIE_ECHO plain: 20 00 00 00 00 00 00 00 02 ff 03 34 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57
-COOKIE_ECHO XOR:   7a a5 3c 5a a5 3c 5a a5 3e a5 a6 08 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55 b5 2d 48 b6 28 4f b3 2b 42 bc 26 41 b9 21 44 ba 59 09 54 22 ca d2 8e 2d 05 97 8d 65 df bb b0 69 9e 9c 0d 0d
-ACCEPT plain: 20 00 00 00 00 00 00 00 02 04 04 01 02 03 04
-ACCEPT XOR:   7a a5 3c 5a a5 3c 5a a5 3e 5e a1 3d 58 a6 38
+cookie: 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96
+client proof: d4 46 94 f0 e1 51 c9 84 63 ec 89 7b e7 60 55 f1 72 8b bd 2a 15 0e 30 61 e6 99 20 9f fb 72 e1 80
+server proof: c6 d3 e8 d7 76 8e ad 65 f4 76 df a3 ff d5 30 de 5d ab 3a 87 1c 36 af b3 b3 bd e5 65 be bf 40 78
+client-to-server key: e0 7c 09 f3 c6 59 38 3e c5 c2 28 bd 4a d7 8b 1c bd 24 39 d5 3e 49 6d be 81 70 3e 03 7c 76 24 49
+server-to-client key: f3 cd 3c a2 18 86 97 00 0f e2 79 61 df c4 de 28 e0 b0 5a 15 a3 5a 9a b3 08 0c c8 1b 3b 98 e2 ad
+HELLO plain: 40 00 00 00 00 00 00 00 01 ff 01 10 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+HELLO wire:  40 00 00 00 00 00 00 00 01 ff 01 10 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+CHALLENGE plain: 40 00 00 00 00 00 00 00 01 02 28 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 00 6f 00 b6 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96
+CHALLENGE wire:  40 00 00 00 00 00 00 00 01 02 28 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 00 6f 00 b6 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96
+COOKIE_ECHO plain: 40 00 00 00 00 00 00 00 02 ff 03 54 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96 d4 46 94 f0 e1 51 c9 84 63 ec 89 7b e7 60 55 f1 72 8b bd 2a 15 0e 30 61 e6 99 20 9f fb 72 e1 80
+COOKIE_ECHO wire:  40 00 00 00 00 00 00 00 02 ff 03 54 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96 d4 46 94 f0 e1 51 c9 84 63 ec 89 7b e7 60 55 f1 72 8b bd 2a 15 0e 30 61 e6 99 20 9f fb 72 e1 80
+ACCEPT plain: 40 00 00 00 00 00 00 00 02 04 24 01 02 03 04 c6 d3 e8 d7 76 8e ad 65 f4 76 df a3 ff d5 30 de 5d ab 3a 87 1c 36 af b3 b3 bd e5 65 be bf 40 78
+ACCEPT wire:  40 00 00 00 00 00 00 00 02 04 24 01 02 03 04 c6 d3 e8 d7 76 8e ad 65 f4 76 df a3 ff d5 30 de 5d ab 3a 87 1c 36 af b3 b3 bd e5 65 be bf 40 78
 ```
 
 **V4: DNS response to V1.**
 
-Empty server envelope for exchange 5. XOR restarts at offset zero; TXT
-length octets and DNS framing are not XORed.
+Empty server envelope for exchange 5. Its nine routing bytes are public.
+TXT length octets and DNS framing are not encrypted.
 
 ```text
-response plain: 20 01 02 03 04 00 00 00 05
-response XOR:   7a a4 3e 59 a1 3c 5a a5 39
+response plain: 40 01 02 03 04 00 00 00 05
+response wire:  40 01 02 03 04 00 00 00 05
 DNS response (81 bytes):
-12 34 85 00 00 01 00 01 00 00 00 01 10 70 6b 73
-64 34 77 6e 62 68 72 6e 6b 6b 6f 6b 33 01 74 07
+12 34 85 00 00 01 00 01 00 00 00 01 10 69 61 61
+71 65 61 79 65 61 61 61 61 61 62 69 7a 01 74 07
 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 10 00 01
-c0 0c 00 10 00 01 00 00 00 00 00 0a 09 7a a4 3e
-59 a1 3c 5a a5 39 00 00 29 04 d0 00 00 00 00 00
+c0 0c 00 10 00 01 00 00 00 00 00 0a 09 40 01 02
+03 04 00 00 00 05 00 00 29 04 d0 00 00 00 00 00
 00
 ```
 
@@ -1033,10 +1126,10 @@ duplicate FIN 32: unchanged; data >=32 or conflicting FIN: protocol violation
 consume data 0..31: shutdown=true
 FIN 32 before any data: (0, 0x80000000, 32)
 then data 31..0: (33, 0x00000000, 0); shutdown=false
-FIN query plain: 20 01 02 03 04 00 00 00 07 01 11 08 00 00 00 01 00 00 00 20
-FIN query XOR:   7a a4 3e 59 a1 3c 5a a5 3b 5b b4 34 5a a5 3c 5b a5 3c 5a 85
-terminal ACK plain: 20 01 02 03 04 00 00 00 07 12 0e 00 00 00 01 00 00 00 21 00 00 00 00 00 00
-terminal ACK XOR:   7a a4 3e 59 a1 3c 5a a5 3b 48 ab 3c 5a a5 3d 5a a5 3c 7b a5 3c 5a a5 3c 5a
+FIN query plain: 40 01 02 03 04 00 00 00 07 01 11 08 00 00 00 01 00 00 00 20
+FIN query wire:  40 01 02 03 04 00 00 00 07 4a 45 35 f3 11 c1 92 6a ec 84 2a
+terminal ACK plain: 40 01 02 03 04 00 00 00 07 12 0e 00 00 00 01 00 00 00 21 00 00 00 00 00 00
+terminal ACK wire:  40 01 02 03 04 00 00 00 07 af 1b a3 70 ee d7 cb c9 01 a5 c6 05 c3 c6 ed 8a
 ```
 
 **V6: saturated lag does not establish delivery.**
@@ -1051,9 +1144,9 @@ exchange=1000 lag=255 -> highest=unknown; no new exchange-loss evidence
 same query ACK (3, 0x00000002, 30) -> cumulative=3, SACKed=[5], credit=33
 exchange=1001 lag=1 -> exact highest=1000
 lag=0 or exact lag >= exchange: invalid
-saturated query plain: 20 01 02 03 04 00 00 03 e8 ff 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e
-saturated query XOR:   7a a4 3e 59 a1 3c 5a a6 d4 a5 b7 32 5a a5 3c 5b a5 3c 5a a6 3c 5a a5 3e 5a bb
-saturated query qname: pksd4wnbhrnknvffw4zfvjj4lostywvghrnkkps2xm.t.example.com
+saturated query plain: 40 01 02 03 04 00 00 03 e8 ff 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e
+saturated query wire:  40 01 02 03 04 00 00 03 e8 f4 3a bb ce 45 36 d4 80 88 7a 28 5a cc 78 2d b7 83
+saturated query qname: iaaqeayeaaaah2huhk544rjw2saiq6rillghqlnxqm.t.example.com
 ```
 
 **V7: tombstone expiry/eviction never reopens a stream.**
@@ -1070,10 +1163,10 @@ admit 65 -> window [2,65]; retry 1 -> RESET(0x06), too old
 admit unseen 2 -> new
 reject 3 for resource limit; retry 3 -> RESET(0x06), used bit retained
 admit 129 -> window [66,129]; traffic for active 2 -> existing stream
-late OPEN plain: 20 01 02 03 04 00 00 00 0b 01 10 0f 00 00 00 01 00 00 00 00 01 cb 00 71 07 01 bb
-late OPEN XOR:   7a a4 3e 59 a1 3c 5a a5 37 5b b5 33 5a a5 3c 5b a5 3c 5a a5 3d 91 a5 4d 5d a4 87
-RESET plain: 20 01 02 03 04 00 00 00 0b 13 05 00 00 00 01 06
-RESET XOR:   7a a4 3e 59 a1 3c 5a a5 37 49 a0 3c 5a a5 3d 5c
+late OPEN plain: 40 01 02 03 04 00 00 00 0b 01 10 0f 00 00 00 01 00 00 00 00 01 cb 00 71 07 01 bb
+late OPEN wire:  40 01 02 03 04 00 00 00 0b 4c 14 e9 66 6e fe 55 8a 8d 9a 2b 79 b2 c0 85 6d cd 71
+RESET plain: 40 01 02 03 04 00 00 00 0b 13 05 00 00 00 01 06
+RESET wire:  40 01 02 03 04 00 00 00 0b 7e 3c 43 61 08 6e 08
 ```
 
 **V8: lost ACCEPT, cookie validation, and retry identity.**
@@ -1087,12 +1180,12 @@ first ACCEPT dropped; retry -> allocations=1, assigned session=0x01020304
 tampered cookie with cached nonces -> SESSION_ERROR(0x06)
 now=1700000030 (exact expiry) -> SESSION_ERROR(0x06), allocations still 1
 full handshake cache -> SESSION_ERROR(0x03), no live-entry eviction
-retry COOKIE_ECHO plain: 20 00 00 00 00 00 00 00 03 ff 03 34 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57
-retry COOKIE_ECHO XOR:   7a a5 3c 5a a5 3c 5a a5 3f a5 a6 08 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55 b5 2d 48 b6 28 4f b3 2b 42 bc 26 41 b9 21 44 ba 59 09 54 22 ca d2 8e 2d 05 97 8d 65 df bb b0 69 9e 9c 0d 0d
-retry ACCEPT plain: 20 00 00 00 00 00 00 00 03 04 04 01 02 03 04
-retry ACCEPT XOR:   7a a5 3c 5a a5 3c 5a a5 3f 5e a1 3d 58 a6 38
-expired plain: 20 00 00 00 00 00 00 00 04 20 01 06
-expired XOR:   7a a5 3c 5a a5 3c 5a a5 38 7a a4 3a
+retry COOKIE_ECHO plain: 40 00 00 00 00 00 00 00 03 ff 03 54 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96 d4 46 94 f0 e1 51 c9 84 63 ec 89 7b e7 60 55 f1 72 8b bd 2a 15 0e 30 61 e6 99 20 9f fb 72 e1 80
+retry COOKIE_ECHO wire:  40 00 00 00 00 00 00 00 03 ff 03 54 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e fd e9 2d 55 c4 c5 41 7c 2c 9e f0 3a a5 19 86 96 d4 46 94 f0 e1 51 c9 84 63 ec 89 7b e7 60 55 f1 72 8b bd 2a 15 0e 30 61 e6 99 20 9f fb 72 e1 80
+retry ACCEPT plain: 40 00 00 00 00 00 00 00 03 04 24 01 02 03 04 c6 d3 e8 d7 76 8e ad 65 f4 76 df a3 ff d5 30 de 5d ab 3a 87 1c 36 af b3 b3 bd e5 65 be bf 40 78
+retry ACCEPT wire:  40 00 00 00 00 00 00 00 03 04 24 01 02 03 04 c6 d3 e8 d7 76 8e ad 65 f4 76 df a3 ff d5 30 de 5d ab 3a 87 1c 36 af b3 b3 bd e5 65 be bf 40 78
+expired plain: 41 00 00 00 00 00 00 00 04 20 01 06
+expired wire:  41 00 00 00 00 00 00 00 04 20 01 06
 ```
 
 **V9: reordered ACKs and lost credit updates.**
@@ -1112,6 +1205,6 @@ credit trace: send/receive 0..31, ACK (32,0,0) -> blocked at credit=32
 consume 0..7; drop ACK (32,0,8) -> sender still blocked
 repeat ACK (32,0,8) -> credit=40; new sequences 32..39 allowed, 40 blocked
 late ACK (32,0,0) -> credit remains 40
-credit repeat plain: 20 01 02 03 04 00 00 00 0c 12 0e 00 00 00 01 00 00 00 20 00 00 00 00 00 08
-credit repeat XOR:   7a a4 3e 59 a1 3c 5a a5 30 48 ab 3c 5a a5 3d 5a a5 3c 7a a5 3c 5a a5 3c 52
+credit repeat plain: 40 01 02 03 04 00 00 00 0c 12 0e 00 00 00 01 00 00 00 20 00 00 00 00 00 08
+credit repeat wire:  40 01 02 03 04 00 00 00 0c 8a 04 37 44 bb ca 28 1d f0 31 47 47 d8 7d 5e 03
 ```

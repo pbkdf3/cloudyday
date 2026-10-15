@@ -3,6 +3,7 @@
 //! repeats, and frame packing (§5, §6, §7.5, §9).
 
 pub mod client;
+mod reverse;
 pub mod server;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -146,7 +147,7 @@ impl AsRef<[u8]> for Chunk {
 /// Commands from a session to the task bridging one TCP connection.
 #[derive(Debug)]
 pub enum WriteCmd {
-    /// Client only: the SOCKS reply to write before bridging.
+    /// The SOCKS reply to write before bridging.
     Reply(OpenResult),
     Data(Chunk),
     /// Shut down the TCP write half after earlier data.
@@ -162,21 +163,21 @@ pub struct IoEvent {
 
 #[derive(Debug)]
 pub enum IoKind {
-    /// Client: a SOCKS CONNECT ready to open a stream.
+    /// A SOCKS CONNECT ready to open a stream.
     Open {
         target: Target,
         writer: mpsc::Sender<WriteCmd>,
         permits: Arc<Semaphore>,
     },
-    /// Client: the SOCKS connection closed before its reply.
+    /// The SOCKS connection closed before its reply.
     Closed,
-    /// Server: the destination connected.
+    /// The destination connected.
     Connected {
         writer: mpsc::Sender<WriteCmd>,
         permits: Arc<Semaphore>,
         local: SocketAddr,
     },
-    /// Server: dialing failed with this OPEN_RESULT status.
+    /// Dialing failed with this OPEN_RESULT status.
     DialFailed(u8),
     Data(Chunk),
     Eof,

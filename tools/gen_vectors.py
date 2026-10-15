@@ -15,7 +15,8 @@ import struct
 
 DOMAIN = ["t", "example", "com"]
 SESSION_ID = 0x01020304
-KEY = bytes.fromhex("5a a5 3c")
+KEY = bytes(range(32))
+VERSION = 2
 SECRET = bytes(range(32))
 CLIENT_NONCE = bytes(range(16))
 SERVER_NONCE = bytes(range(16, 32))
@@ -52,14 +53,62 @@ def wire_name(name_labels):
     return b"".join(bytes([len(s)]) + s.encode("ascii") for s in name_labels) + b"\x00"
 
 
-def xor(data, key=KEY):
-    if not key:
-        raise ValueError("empty XOR key")
-    return bytes(value ^ key[i % len(key)] for i, value in enumerate(data))
+def transcript(cn=CLIENT_NONCE, sn=SERVER_NONCE, supplied=None, session=0):
+    if supplied is None:
+        supplied = cookie()
+    return (bytes([VERSION]) + wire_name(DOMAIN) + cn + sn
+            + struct.pack(">HH", U, D) + supplied + struct.pack(">I", session))
+
+
+def proof(label, cn=CLIENT_NONCE, sn=SERVER_NONCE, supplied=None, session=0):
+    return hmac.new(KEY, label + transcript(cn, sn, supplied, session), hashlib.sha256).digest()
+
+
+def session_key(direction):
+    salt = hashlib.sha256(transcript(session=SESSION_ID)).digest()
+    prk = hmac.new(salt, KEY, hashlib.sha256).digest()
+    info = b"cloudyday v2 " + direction
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+
+def chacha20(data, key, nonce):
+    """Independent RFC 8439 oracle, not production cryptography."""
+    if len(key) != 32 or len(nonce) != 12:
+        raise ValueError("ChaCha20 key/nonce length")
+    def rotate(x, n):
+        return ((x << n) | (x >> (32 - n))) & MAX_U32
+    def quarter(s, a, b, c, d):
+        s[a] = (s[a] + s[b]) & MAX_U32; s[d] = rotate(s[d] ^ s[a], 16)
+        s[c] = (s[c] + s[d]) & MAX_U32; s[b] = rotate(s[b] ^ s[c], 12)
+        s[a] = (s[a] + s[b]) & MAX_U32; s[d] = rotate(s[d] ^ s[a], 8)
+        s[c] = (s[c] + s[d]) & MAX_U32; s[b] = rotate(s[b] ^ s[c], 7)
+    output = bytearray()
+    for counter, offset in enumerate(range(0, len(data), 64)):
+        initial = list(struct.unpack("<4I", b"expand 32-byte k") + struct.unpack("<8I", key)
+                       + (counter,) + struct.unpack("<3I", nonce))
+        state = initial.copy()
+        for _ in range(10):
+            for indices in [(0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+                            (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14)]:
+                quarter(state, *indices)
+        block = struct.pack("<16I", *((x + y) & MAX_U32 for x, y in zip(state, initial)))
+        output.extend(a ^ b for a, b in zip(data[offset:offset + 64], block))
+    return bytes(output)
+
+
+def wire(data, server_side=False):
+    session, exchange = struct.unpack(">II", data[1:9])
+    if session == 0 or data[0] & 1:  # Public handshake/error.
+        return data
+    if exchange == 0:
+        raise ValueError("exchange ID zero")
+    direction = b"server to client" if server_side else b"client to server"
+    nonce = bytes(4) + data[1:9]
+    return data[:9] + chacha20(data[9:], session_key(direction), nonce)
 
 
 def qname(envelope):
-    return ".".join(labels(b32(xor(envelope))) + DOMAIN)
+    return ".".join(labels(b32(wire(envelope))) + DOMAIN)
 
 
 def hexdump(data):
@@ -71,11 +120,11 @@ def frame(kind, body):
 
 
 def client(exchange, lag, frames=b"", session=SESSION_ID):
-    return struct.pack(">BIIB", 0x20, session, exchange, lag) + frames
+    return struct.pack(">BIIB", VERSION << 5, session, exchange, lag) + frames
 
 
 def server(exchange, frames=b"", session=SESSION_ID):
-    return struct.pack(">BII", 0x20, session, exchange) + frames
+    return struct.pack(">BII", (VERSION << 5) | int(frames[:1] == b"\x20"), session, exchange) + frames
 
 
 def ack(stream, next_expected, sack, delta):
@@ -99,7 +148,7 @@ def dns_query(envelope):
 
 
 def dns_response(query_envelope, response_envelope):
-    encoded = xor(response_envelope)
+    encoded = wire(response_envelope, True)
     rdata = b"".join(bytes([len(encoded[i:i + 255])]) + encoded[i:i + 255]
                      for i in range(0, len(encoded), 255))
     result = (struct.pack(">HHHHHH", 0x1234, 0x8500, 1, 1, 0, 1)
@@ -112,7 +161,7 @@ def dns_response(query_envelope, response_envelope):
 
 def cookie(expiry=EXPIRY, client_nonce=CLIENT_NONCE, server_nonce=SERVER_NONCE):
     tail = struct.pack(">IHH", expiry, U, D)
-    message = (b"cloudyday v1 cookie" + b"\x01" + wire_name(DOMAIN)
+    message = (b"cloudyday v2 cookie" + bytes([VERSION]) + wire_name(DOMAIN)
                + client_nonce + server_nonce + tail)
     return struct.pack(">I", expiry) + hmac.new(SECRET, message, hashlib.sha256).digest()[:16]
 
@@ -237,13 +286,16 @@ class Handshakes:
         self.cache = {}
 
     def echo(self, body, exchange, now):
-        cn, sn, supplied = body[:16], body[16:32], body[32:]
-        if len(body) != 52:
+        cn, sn, supplied, auth = body[:16], body[16:32], body[32:52], body[52:]
+        if len(body) != 84:
             raise ValueError("bad COOKIE_ECHO length")
         expiry = struct.unpack(">I", supplied[:4])[0]
         valid = hmac.compare_digest(supplied, cookie(expiry, cn, sn))
         if not valid or now >= expiry:
             return server(exchange, frame(0x20, b"\x06"), session=0)
+        if not hmac.compare_digest(auth, proof(b"cloudyday v2 client proof", cn, sn, supplied)):
+            return None
+        body = body[:52]
         self.cache = {key: entry for key, entry in self.cache.items() if entry[1] > now}
         if body not in self.cache:
             if len(self.cache) >= self.capacity:
@@ -251,7 +303,8 @@ class Handshakes:
             self.cache[body] = (SESSION_ID + self.allocations, expiry)
             self.allocations += 1
         session, _ = self.cache[body]
-        return server(exchange, frame(0x04, struct.pack(">I", session)), session=0)
+        return server(exchange, frame(0x04, struct.pack(">I", session)
+                      + proof(b"cloudyday v2 server proof", cn, sn, supplied, session)), session=0)
 
 
 def generate():
@@ -262,28 +315,29 @@ standard library. `python3 tools/gen_vectors.py --check` runs the vector
 assertions and verifies that this section is current. These are codec examples
 and small state-transition oracles, not substitutes for implementation tests.
 
-Unless noted otherwise, use session `0x01020304`, domain `t.example.com`, and
-XOR key `5a a5 3c`. `plain` means serialized bytes before XOR, never plaintext
-on the wire. All query names and DNS packets below include required XOR.
+Unless noted otherwise, use session `0x01020304`, domain `t.example.com`, shared
+secret bytes `00`–`1f`, and the V3 handshake transcript for session keys. `plain`
+is the serialized envelope; `wire` retains its first nine routing bytes and
+ChaCha20-encrypts the remainder. Handshakes and marked errors are public.
 """]
 
     def emit(title, explanation, lines):
         sections.append(f"**{title}**\n\n{explanation}\n\n```text\n" + "\n".join(lines) + "\n```\n")
 
-    def envelopes(name, raw, query=False):
-        expect(xor(xor(raw)), raw)
-        result = [f"{name} plain: {raw.hex(' ')}", f"{name} XOR:   {xor(raw).hex(' ')}"]
+    def envelopes(name, raw, query=False, server_side=False):
+        expect(wire(wire(raw, server_side), server_side), raw)
+        result = [f"{name} plain: {raw.hex(' ')}", f"{name} wire:  {wire(raw, server_side).hex(' ')}"]
         if query:
             result.append(f"{name} qname: {qname(raw)}")
         return result
 
-    rejects(lambda: xor(b"test", b""))
+    # RFC 8439: all-zero key/nonce, counter zero, first 16 stream bytes.
+    expect(chacha20(bytes(16), bytes(32), bytes(12)).hex(), "76b8e0ada0f13d90405d6ae55386bd28")
+    rejects(lambda: chacha20(b"test", b"", bytes(12)))
     poll = client(5, 1)
-    expect(xor(poll).hex(), "7aa43e59a13c5aa5395b")
-    expect(qname(poll), "pksd4wnbhrnkkok3.t.example.com")
     query = dns_query(poll)
     expect(len(query), 59)
-    emit("V1: XOR client poll.", "Exchange 5, `rx_lag = 1`, no frames; DNS ID `0x1234`.",
+    emit("V1: ChaCha20 client poll.", "Exchange 5, `rx_lag = 1`, no frames; DNS ID `0x1234`.",
          envelopes("poll", poll, True) + [f"DNS query ({len(query)} bytes):", hexdump(query)])
 
     mixed = client(6, 1, ack(1, 3, 2, 30) + segment(1, 0, b"hello"))
@@ -296,23 +350,29 @@ on the wire. All query names and DNS packets below include required XOR.
     challenge_cookie = cookie()
     hello = client(1, 255, frame(0x01, CLIENT_NONCE), session=0)
     challenge = server(1, frame(0x02, SERVER_NONCE + struct.pack(">HH", U, D) + challenge_cookie), session=0)
-    echo_body = CLIENT_NONCE + SERVER_NONCE + challenge_cookie
+    echo_body = (CLIENT_NONCE + SERVER_NONCE + challenge_cookie
+                 + proof(b"cloudyday v2 client proof"))
     echo = client(2, 255, frame(0x03, echo_body), session=0)
     handshakes = Handshakes()
     accepted = handshakes.echo(echo_body, 2, NOW)
-    expect((len(hello), len(challenge), len(echo), len(accepted)), (28, 51, 64, 15))
-    emit("V3: cookie handshake, no peer authentication.",
+    expect((len(hello), len(challenge), len(echo), len(accepted)), (28, 51, 96, 47))
+    emit("V3: authenticated shared-secret handshake.",
          "All envelope session IDs are zero; ACCEPT assigns `0x01020304`. Use the\n"
          "recommended cookie construction with server secret bytes `00`–`1f`, client\n"
          "nonce `00`–`0f`, server nonce `10`–`1f`, expiry 1700000030, and U=111, D=182.\n"
-         "The cookie HMAC is server-only; no envelope carries a MAC or token proof.",
-         [f"cookie: {challenge_cookie.hex(' ')}"]
+         "COOKIE_ECHO authenticates the client; ACCEPT authenticates the server and\n"
+         "assigned session. HKDF-SHA256 derives separate direction keys from the secret.",
+         [f"cookie: {challenge_cookie.hex(' ')}",
+          f"client proof: {proof(b'cloudyday v2 client proof').hex(' ')}",
+          f"server proof: {proof(b'cloudyday v2 server proof', session=SESSION_ID).hex(' ')}",
+          f"client-to-server key: {session_key(b'client to server').hex(' ')}",
+          f"server-to-client key: {session_key(b'server to client').hex(' ')}"]
          + envelopes("HELLO", hello) + envelopes("CHALLENGE", challenge)
          + envelopes("COOKIE_ECHO", echo) + envelopes("ACCEPT", accepted))
 
     response = dns_response(poll, server(5))
     expect(len(response), 81)
-    # Check the directional budgets and XOR across TXT character-string splits.
+    # Check unchanged directional budgets and encryption across TXT splits.
     max_query = client(6, 1, ack(1, 0, 0, 32) + segment(1, 0, b"u" * U))
     max_response = server(6, ack(1, 1, 0, 31) + segment(1, 0, b"d" * D))
     expect((len(max_query), len(question(max_query))), (147, 259))
@@ -325,11 +385,11 @@ on the wire. All query names and DNS packets below include required XOR.
     expect(len(packet), 508)
     rdata = packet[12 + len(question(minimal_poll)) + 12:-len(OPT)]
     expect((rdata[0], rdata[256]), (255, len(two_segments) - 255))
-    expect(xor(rdata[1:256] + rdata[257:]), two_segments)
+    expect(wire(rdata[1:256] + rdata[257:], True), two_segments)
     emit("V4: DNS response to V1.",
-         "Empty server envelope for exchange 5. XOR restarts at offset zero; TXT\n"
-         "length octets and DNS framing are not XORed.",
-         envelopes("response", server(5)) + [f"DNS response ({len(response)} bytes):", hexdump(response)])
+         "Empty server envelope for exchange 5. Its nine routing bytes are public.\n"
+         "TXT length octets and DNS framing are not encrypted.",
+         envelopes("response", server(5), server_side=True) + [f"DNS response ({len(response)} bytes):", hexdump(response)])
 
     receiver = Receiver()
     for seq in range(32):
@@ -366,7 +426,7 @@ on the wire. All query names and DNS packets below include required XOR.
           "FIN 32 before any data: (0, 0x80000000, 32)",
           "then data 31..0: (33, 0x00000000, 0); shutdown=false"]
          + envelopes("FIN query", client(7, 1, fin(1, 32)))
-         + envelopes("terminal ACK", server(7, ack(1, 33, 0, 0))))
+         + envelopes("terminal ACK", server(7, ack(1, 33, 0, 0)), server_side=True))
 
     expect(response_evidence(1000, 254), 746)
     expect(response_evidence(1000, 255), None)
@@ -423,13 +483,16 @@ on the wire. All query names and DNS packets below include required XOR.
           "reject 3 for resource limit; retry 3 -> RESET(0x06), used bit retained",
           "admit 129 -> window [66,129]; traffic for active 2 -> existing stream"]
          + envelopes("late OPEN", client(11, 1, opening))
-         + envelopes("RESET", server(11, frame(0x13, struct.pack(">IB", 1, 6)))))
+         + envelopes("RESET", server(11, frame(0x13, struct.pack(">IB", 1, 6))), server_side=True))
 
     retry_echo = client(3, 255, frame(0x03, echo_body), session=0)
     retry_accept = handshakes.echo(echo_body, 3, NOW + 2)
-    expect(retry_accept, server(3, frame(0x04, struct.pack(">I", SESSION_ID)), session=0))
+    expect(retry_accept, server(3, frame(0x04, struct.pack(">I", SESSION_ID)
+                               + proof(b"cloudyday v2 server proof", session=SESSION_ID)), session=0))
     expect(handshakes.allocations, 1)
-    tampered = echo_body[:-1] + bytes([echo_body[-1] ^ 1])
+    tampered = echo_body[:51] + bytes([echo_body[51] ^ 1]) + echo_body[52:]
+    bad_proof = echo_body[:-1] + bytes([echo_body[-1] ^ 1])
+    expect(handshakes.echo(bad_proof, 4, NOW + 2), None)
     error = server(4, frame(0x20, b"\x06"), session=0)
     expect(handshakes.echo(tampered, 4, NOW + 2), error)
     expired = handshakes.echo(echo_body, 4, EXPIRY)
@@ -438,7 +501,9 @@ on the wire. All query names and DNS packets below include required XOR.
     limited = Handshakes(capacity=1)
     expect(limited.echo(echo_body, 2, NOW), accepted)
     other_nonce = bytes(reversed(CLIENT_NONCE))
-    other_echo = other_nonce + SERVER_NONCE + cookie(client_nonce=other_nonce)
+    other_cookie = cookie(client_nonce=other_nonce)
+    other_echo = (other_nonce + SERVER_NONCE + other_cookie
+                  + proof(b"cloudyday v2 client proof", other_nonce, SERVER_NONCE, other_cookie))
     expect(limited.echo(other_echo, 2, NOW), server(2, frame(0x20, b"\x03"), session=0))
     expect(limited.echo(echo_body, 3, NOW + 2), retry_accept)
     expect((limited.allocations, len(limited.cache)), (1, 1))
@@ -493,23 +558,31 @@ on the wire. All query names and DNS packets below include required XOR.
           "consume 0..7; drop ACK (32,0,8) -> sender still blocked",
           "repeat ACK (32,0,8) -> credit=40; new sequences 32..39 allowed, 40 blocked",
           "late ACK (32,0,0) -> credit remains 40"]
-         + envelopes("credit repeat", server(12, ack(1, 32, 0, 8))))
+         + envelopes("credit repeat", server(12, ack(1, 32, 0, 8)), server_side=True))
 
     return "\n".join(sections)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="verify DESIGN.md A.7 instead of printing it")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="verify DESIGN.md A.7 instead of printing it")
+    mode.add_argument("--update", action="store_true", help="regenerate DESIGN.md A.7 in place")
     args = parser.parse_args()
     generated = generate()
-    if args.check:
+    if args.check or args.update:
         design = Path(__file__).resolve().parents[1] / "DESIGN.md"
         marker = "### A.7 Test vectors\n"
         contents = design.read_text()
-        if marker not in contents or marker + contents.split(marker, 1)[1] != generated:
-            raise SystemExit("DESIGN.md A.7 is stale; regenerate with tools/gen_vectors.py")
-        print("All wire/state vector assertions passed; DESIGN.md A.7 matches.")
+        if marker not in contents:
+            raise SystemExit("DESIGN.md A.7 marker is missing")
+        if args.update:
+            design.write_text(contents.split(marker, 1)[0] + generated)
+            print("Regenerated DESIGN.md A.7.")
+        elif marker + contents.split(marker, 1)[1] != generated:
+            raise SystemExit("DESIGN.md A.7 is stale; regenerate with tools/gen_vectors.py --update")
+        else:
+            print("All wire/state vector assertions passed; DESIGN.md A.7 matches.")
     else:
         print(generated, end="")
 

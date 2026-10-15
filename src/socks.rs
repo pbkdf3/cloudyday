@@ -13,6 +13,59 @@ use tracing::debug;
 use crate::session::{Budget, Chunk, IoEvent, IoKind, WRITE_QUEUE, WriteCmd};
 use crate::wire::{Host, OpenResult, Target, status, valid_hostname};
 
+/// Start a destination connection and bridge it using the same machinery in
+/// either tunnel direction. Dropped session writers close the bridge.
+pub(crate) fn spawn_dial(
+    action: crate::session::server::Action,
+    events: mpsc::Sender<IoEvent>,
+    segment: usize,
+    budget: Budget,
+    allow_private: bool,
+) {
+    let crate::session::server::Action::Dial {
+        key,
+        target,
+        deadline,
+    } = action;
+    tokio::spawn(async move {
+        match crate::filter::dial(
+            &target,
+            tokio::time::Instant::from_std(deadline),
+            allow_private,
+        )
+        .await
+        {
+            Ok(tcp) => {
+                let local = tcp.local_addr().unwrap_or(UNSPECIFIED);
+                let (writer, writes) = mpsc::channel(WRITE_QUEUE);
+                let permits = Arc::new(Semaphore::new(0));
+                if events
+                    .send(IoEvent {
+                        key,
+                        kind: IoKind::Connected {
+                            writer,
+                            permits: permits.clone(),
+                            local,
+                        },
+                    })
+                    .await
+                    .is_ok()
+                {
+                    bridge(tcp, key, segment, events, permits, writes, budget).await;
+                }
+            }
+            Err(code) => {
+                let _ = events
+                    .send(IoEvent {
+                        key,
+                        kind: IoKind::DialFailed(code),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 const NO_ACCEPTABLE_METHODS: u8 = 0xff;
 const COMMAND_NOT_SUPPORTED: u8 = 0x07;

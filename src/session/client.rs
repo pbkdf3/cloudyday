@@ -5,24 +5,27 @@ use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::server::random_bytes;
+use super::reverse::{self, Streams};
+use super::server::{Action, BUFFER_LIMIT, random_bytes};
 use super::{
     ACK_BATCH, Budget, Chunk, HasPipe, IoEvent, IoKind, KEEPALIVE, MAX_STREAMS, OPEN_DEADLINE,
     Packer, Pipe, ResetRepeats, SESSION_EXPIRY, Tombstone, Tombstones, WriteCmd, now, pack_acks,
     pack_data,
 };
 use crate::arq::{Admit, Delivery, Rtt};
+use crate::crypto::{SessionKeys, SharedSecret};
 use crate::dns::{self, ResponseError, Sizes, TunnelDomain};
 use crate::socks;
 use crate::wire::{
-    CLIENT_HEADER_LEN, Direction, Envelope, Frame, LAG_UNKNOWN, MAX_OPEN_RECORD, NONCE_LEN,
-    OpenResult, StreamAck, Target, XorKey, reset, session_error, status,
+    CLIENT_HEADER_LEN, CookieInput, Direction, Envelope, FLAG_PLAIN_ERROR, Frame, LAG_UNKNOWN,
+    MAX_OPEN_RECORD, NONCE_LEN, OpenResult, StreamAck, Target, reset, session_error, status,
 };
 
 const MIN_DEPTH: usize = 2;
@@ -62,7 +65,8 @@ struct Outstanding {
 /// DNS-facing state: encodes envelopes into queries and tracks them.
 struct Transport {
     domain: TunnelDomain,
-    key: XorKey,
+    key: SharedSecret,
+    crypto: Option<SessionKeys>,
     outstanding: HashMap<u16, Outstanding>,
     out: Vec<Vec<u8>>,
     /// Bumped whenever a handshake starts or a session ends, so responses
@@ -80,7 +84,13 @@ impl Transport {
         now: Instant,
     ) {
         let mut bytes = env.encode();
-        self.key.apply(&mut bytes);
+        if kind == Kind::Session {
+            self.crypto
+                .as_ref()
+                .expect("established session keys")
+                .apply(&mut bytes, Direction::ClientToServer)
+                .expect("session envelope");
+        }
         let id = loop {
             let id = u16::from_be_bytes(random_bytes());
             if !self.outstanding.contains_key(&id) {
@@ -210,10 +220,17 @@ struct Session {
     slot_wanted: bool,
     cursor: u32,
     budget: Budget,
+    reverse: Streams,
 }
 
 impl Session {
-    fn new(id: u32, now: Instant) -> Session {
+    fn new(
+        id: u32,
+        now: Instant,
+        sizes: Sizes,
+        key_source: Arc<AtomicU64>,
+        reverse_budget: Budget,
+    ) -> Session {
         Session {
             id,
             next_exchange: 1,
@@ -233,12 +250,13 @@ impl Session {
             slot_wanted: false,
             cursor: 0,
             budget: Budget::unlimited(),
+            reverse: Streams::new(false, sizes.u, sizes.d, reverse_budget, key_source),
         }
     }
 
     fn admit(&mut self, open: PendingOpen, sizes: &Sizes, now: Instant) -> bool {
         let id = self.next_stream;
-        let Some(next) = id.checked_add(1) else {
+        let Some(next) = id.checked_add(1).filter(|&next| next < reverse::FIRST_ID) else {
             return false;
         };
         self.next_stream = next;
@@ -288,7 +306,8 @@ impl Session {
     }
 
     fn has_upload_work(&self, now: Instant) -> bool {
-        self.resets.due(now)
+        self.reverse.pending(now)
+            || self.resets.due(now)
             || !self.late_acks.is_empty()
             || self
                 .streams
@@ -316,7 +335,8 @@ impl Session {
         }
         let idle = now.saturating_duration_since(self.last_activity);
         let interval = match () {
-            _ if self.streams.is_empty() => KEEPALIVE,
+            // Poll for server-initiated opens even with no local connections.
+            _ if self.streams.is_empty() => Duration::from_secs(1),
             _ if idle < Duration::from_secs(10) => Duration::from_secs(1),
             _ if idle < Duration::from_secs(60) => Duration::from_secs(5),
             _ => KEEPALIVE,
@@ -332,6 +352,7 @@ impl Session {
             .highest_response
             .map_or(LAG_UNKNOWN, |h| (exchange - h).min(255) as u8);
         let mut packer = Packer::new(sizes.max_query_envelope - CLIENT_HEADER_LEN);
+        self.reverse.pack_acks(&mut packer, now, ACK_BATCH);
         self.resets.pack(&mut packer, now);
         while let Some(ack) = self.late_acks.pop() {
             if !packer.push(Frame::StreamAck(ack)) {
@@ -340,15 +361,39 @@ impl Session {
             }
         }
         let mut broken = pack_acks(&mut self.streams, &mut packer, ACK_BATCH);
-        let carried = pack_data(
+        // Alternate direction priority so a busy forward stream cannot starve
+        // reverse SOCKS. Share the query's total data-stream budget.
+        let count = |carried: &Vec<(u32, u32)>| {
+            carried
+                .iter()
+                .map(|&(id, _)| id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        let mut carried = if exchange.is_multiple_of(2) {
+            self.reverse
+                .pack_data(&mut packer, exchange, sizes.max_data_streams, now)
+        } else {
+            Vec::new()
+        };
+        carried.extend(pack_data(
             &mut self.streams,
             &mut self.cursor,
             &mut packer,
             exchange,
-            sizes.max_data_streams,
+            sizes.max_data_streams.saturating_sub(count(&carried)),
             now,
-        );
+        ));
+        if !exchange.is_multiple_of(2) {
+            carried.extend(self.reverse.pack_data(
+                &mut packer,
+                exchange,
+                sizes.max_data_streams.saturating_sub(count(&carried)),
+                now,
+            ));
+        }
         broken.extend(pack_acks(&mut self.streams, &mut packer, usize::MAX));
+        self.reverse.pack_acks(&mut packer, now, usize::MAX);
         for id in broken {
             self.reset_stream(id, reset::EXHAUSTED, now);
         }
@@ -364,6 +409,11 @@ impl Session {
     fn apply(&mut self, frames: Vec<Frame>, now: Instant) -> bool {
         let mut got_data = false;
         for frame in frames {
+            if reverse::is_reverse(&frame) {
+                let available = MAX_STREAMS.saturating_sub(self.streams.len() + self.reverse.len());
+                got_data |= self.reverse.apply(frame, now, available);
+                continue;
+            }
             match frame {
                 Frame::StreamAck(ack) => {
                     if let Some(stream) = self.streams.get_mut(&ack.stream)
@@ -520,6 +570,7 @@ impl Session {
 
     fn timers(&mut self, now: Instant) {
         let rto = self.rtt.rto();
+        self.reverse.timers(now, rto, None);
         let mut aborts = Vec::new();
         for (&id, stream) in self.streams.iter_mut() {
             stream.pipe.send.expire(now, rto);
@@ -549,6 +600,7 @@ impl Session {
         [
             self.query_due(in_flight, now),
             self.resets.next_deadline(now),
+            self.reverse.next_deadline(now, rto),
         ]
         .into_iter()
         .flatten()
@@ -571,17 +623,20 @@ pub struct ClientCore {
     state: State,
     pending: VecDeque<PendingOpen>,
     backoff_until: Option<Instant>,
-    /// The server speaks another protocol version; never retry.
+    /// Unsupported protocol version or replaced by a newer client; never retry.
     fatal: bool,
+    reverse_keys: Arc<AtomicU64>,
+    reverse_budget: Budget,
 }
 
 impl ClientCore {
-    pub fn new(domain: TunnelDomain, key: XorKey) -> Result<ClientCore, String> {
+    pub fn new(domain: TunnelDomain, key: SharedSecret) -> Result<ClientCore, String> {
         let sizes = domain.sizes()?;
         Ok(ClientCore {
             transport: Transport {
                 domain,
                 key,
+                crypto: None,
                 outstanding: HashMap::new(),
                 out: Vec::new(),
                 generation: 0,
@@ -591,6 +646,8 @@ impl ClientCore {
             pending: VecDeque::new(),
             backoff_until: None,
             fatal: false,
+            reverse_keys: Arc::new(AtomicU64::new(1)),
+            reverse_budget: Budget::new(BUFFER_LIMIT),
         })
     }
 
@@ -614,6 +671,12 @@ impl ClientCore {
     }
 
     pub fn handle_io(&mut self, event: IoEvent, now: Instant) {
+        if event.key & reverse::KEY_BIT != 0 {
+            if let State::Established(session) = &mut self.state {
+                session.reverse.handle_io(event, now);
+            }
+            return;
+        }
         match event.kind {
             IoKind::Open {
                 target,
@@ -661,7 +724,23 @@ impl ClientCore {
             }
             Err(ResponseError::Malformed) => return,
         };
-        self.transport.key.apply(&mut payload);
+        if query.generation != self.transport.generation {
+            return;
+        }
+        // Public errors have a dedicated existing flag bit, not a tag/nonce.
+        // They are explicitly untrusted and can only tear down/retry a session.
+        if query.kind == Kind::Session && payload.first().is_none_or(|b| b & FLAG_PLAIN_ERROR == 0)
+        {
+            let Some(crypto) = &self.transport.crypto else {
+                return;
+            };
+            if crypto
+                .apply(&mut payload, Direction::ServerToClient)
+                .is_none()
+            {
+                return;
+            }
+        }
         let Ok(env) = Envelope::decode(&payload, Direction::ServerToClient) else {
             return;
         };
@@ -725,12 +804,49 @@ impl ClientCore {
                 handshake.timeout = HANDSHAKE_TIMEOUT;
                 handshake.next_send = now;
             }
-            (&Frame::Accept { session_id }, false, Kind::Echo) if session_id != 0 => {
+            (&Frame::Accept { session_id, proof }, false, Kind::Echo) if session_id != 0 => {
+                let Stage::Echo {
+                    server_nonce,
+                    cookie,
+                } = &handshake.stage
+                else {
+                    return;
+                };
+                let input = CookieInput {
+                    domain_wire: self.transport.domain.wire(),
+                    client_nonce: &handshake.nonce,
+                    server_nonce,
+                    u: self.sizes.u as u16,
+                    d: self.sizes.d as u16,
+                };
+                if !self
+                    .transport
+                    .key
+                    .verify_server(&input, cookie, session_id, &proof)
+                {
+                    debug!("server handshake authentication failed");
+                    return;
+                }
+                self.transport.crypto =
+                    Some(self.transport.key.session_keys(&input, cookie, session_id));
                 info!(session = format!("{session_id:08x}"), "session established");
                 self.transport.generation += 1;
-                self.state = State::Established(Box::new(Session::new(session_id, now)));
+                self.state = State::Established(Box::new(Session::new(
+                    session_id,
+                    now,
+                    self.sizes,
+                    self.reverse_keys.clone(),
+                    self.reverse_budget.clone(),
+                )));
             }
             (&Frame::SessionError { reason }, _, _) => match reason {
+                session_error::REPLACED => {
+                    warn!(
+                        "a newer client owns the reverse proxy; restart this client to reconnect"
+                    );
+                    self.fatal = true;
+                    self.fail_handshake(now);
+                }
                 session_error::BUSY => {
                     warn!("server busy; retrying later");
                     self.fail_handshake(now);
@@ -755,6 +871,7 @@ impl ClientCore {
             open.fail(status::FAILURE);
         }
         self.state = State::Idle;
+        self.transport.crypto = None;
         self.transport.generation += 1;
         self.backoff_until = Some(now + HANDSHAKE_BACKOFF);
     }
@@ -767,6 +884,7 @@ impl ClientCore {
                 "session lost; failing its connections"
             );
         }
+        self.transport.crypto = None;
         self.transport.generation += 1;
     }
 
@@ -780,6 +898,16 @@ impl ClientCore {
         if let [Frame::SessionError { reason }] = env.frames[..] {
             match reason {
                 session_error::UNKNOWN_SESSION => self.fail_session(),
+                session_error::REPLACED => {
+                    warn!(
+                        "a newer client owns the reverse proxy; restart this client to reconnect"
+                    );
+                    self.fatal = true;
+                    self.fail_session();
+                    for open in self.pending.drain(..) {
+                        open.fail(status::FAILURE);
+                    }
+                }
                 session_error::UNSUPPORTED_VERSION => {
                     error!("server does not support this protocol version");
                     self.fatal = true;
@@ -804,6 +932,7 @@ impl ClientCore {
         // STREAM_ACKs do not cover were rejected.
         let rto = session.rtt.rto();
         for &(id, seq) in &query.carried {
+            session.reverse.mark_lost(id, seq, query.exchange, now, rto);
             if let Some(stream) = session.streams.get_mut(&id) {
                 stream.pipe.send.mark_lost(seq, query.exchange, now, rto);
             }
@@ -821,6 +950,9 @@ impl ClientCore {
         for id in lost {
             let old = self.transport.outstanding.remove(&id).expect("listed");
             for (stream, seq) in old.carried {
+                session
+                    .reverse
+                    .mark_lost(stream, seq, old.exchange, now, rto);
                 if let Some(stream) = session.streams.get_mut(&stream) {
                     stream.pipe.send.mark_lost(seq, old.exchange, now, rto);
                 }
@@ -863,7 +995,6 @@ impl ClientCore {
         self.pending.retain(|open| !open.writer.is_closed());
 
         if matches!(self.state, State::Idle)
-            && !self.pending.is_empty()
             && !self.fatal
             && self.backoff_until.is_none_or(|until| now >= until)
         {
@@ -898,7 +1029,7 @@ impl ClientCore {
                 warn!("handshake timed out");
             } else {
                 warn!(
-                    "no valid reply during the handshake: probable --domain, --resolver, or XOR key mismatch"
+                    "no valid reply during the handshake: probable --domain, --resolver, or shared-secret mismatch"
                 );
             }
             return self.fail_handshake(now);
@@ -921,6 +1052,16 @@ impl ClientCore {
                     client_nonce: handshake.nonce,
                     server_nonce,
                     cookie,
+                    proof: self.transport.key.client_proof(
+                        &CookieInput {
+                            domain_wire: self.transport.domain.wire(),
+                            client_nonce: &handshake.nonce,
+                            server_nonce: &server_nonce,
+                            u: self.sizes.u as u16,
+                            d: self.sizes.d as u16,
+                        },
+                        &cookie,
+                    ),
                 },
                 Kind::Echo,
             ),
@@ -943,7 +1084,7 @@ impl ClientCore {
             warn!("no valid response for 60 s");
             return self.fail_session();
         }
-        while session.streams.len() < MAX_STREAMS
+        while session.streams.len() + session.reverse.len() < MAX_STREAMS
             && let Some(open) = self.pending.pop_front()
         {
             if !session.admit(open, &self.sizes, now) {
@@ -973,6 +1114,14 @@ impl ClientCore {
         }
     }
 
+    /// Destination connection attempts requested by reverse streams.
+    pub fn take_actions(&mut self) -> Vec<Action> {
+        match &mut self.state {
+            State::Established(session) => session.reverse.take_actions(),
+            _ => Vec::new(),
+        }
+    }
+
     /// When `poll` next needs to run.
     pub fn next_deadline(&self, now: Instant) -> Instant {
         let mut at = now + MAX_SLEEP;
@@ -981,7 +1130,7 @@ impl ClientCore {
         }
         match &self.state {
             State::Idle => {
-                if !self.pending.is_empty()
+                if !self.fatal
                     && let Some(until) = self.backoff_until
                 {
                     at = at.min(until);
@@ -1000,7 +1149,7 @@ impl ClientCore {
 
 pub struct ClientOptions {
     pub domain: TunnelDomain,
-    pub key: XorKey,
+    pub key: SharedSecret,
 }
 
 /// The SOCKS listener and the DNS query socket.
@@ -1042,6 +1191,7 @@ impl Client {
         let (events_tx, mut events) = mpsc::channel(1024);
         let segment = self.core.sizes().u;
         let listener = self.listener;
+        let accept_events = events_tx.clone();
         let accept = tokio::spawn(async move {
             let mut next_key = 1u64;
             loop {
@@ -1049,7 +1199,7 @@ impl Client {
                     Ok((tcp, peer)) => {
                         debug!(%peer, "SOCKS connection");
                         let _ = tcp.set_nodelay(true);
-                        tokio::spawn(socks::serve(tcp, next_key, events_tx.clone(), segment));
+                        tokio::spawn(socks::serve(tcp, next_key, accept_events.clone(), segment));
                         next_key += 1;
                     }
                     Err(e) => {
@@ -1061,6 +1211,10 @@ impl Client {
         });
         let _abort_accept = AbortOnDrop(accept);
         let mut buf = vec![0u8; 65535];
+        // Establish a session without waiting for a local SOCKS request.
+        for packet in self.core.poll(now()) {
+            self.socket.send(&packet).await?;
+        }
         loop {
             let deadline = tokio::time::Instant::from_std(self.core.next_deadline(now()));
             tokio::select! {
@@ -1076,6 +1230,16 @@ impl Client {
                     debug!(%e, "send failed");
                 }
             }
+            for action in self.core.take_actions() {
+                // Reverse SOCKS deliberately reaches the client's private network.
+                socks::spawn_dial(
+                    action,
+                    events_tx.clone(),
+                    segment,
+                    self.core.reverse_budget.clone(),
+                    true,
+                );
+            }
         }
     }
 }
@@ -1087,3 +1251,7 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;

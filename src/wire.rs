@@ -1,16 +1,17 @@
-//! Bounded binary codecs: envelopes, frames, XOR, server cookies, and the
+//! Bounded binary codecs: envelopes, frames, server cookies, and the
 //! opening records carried at the start of each stream direction (Appendix A).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
+/// Public, unencrypted error when session keys are unavailable. Not trusted.
+pub const FLAG_PLAIN_ERROR: u8 = 0x01;
 pub const FLAG_MORE_PENDING: u8 = 0x02;
-const RESERVED_FLAGS: u8 = 0x1d;
+const RESERVED_FLAGS: u8 = 0x1c;
 
 pub const CLIENT_HEADER_LEN: usize = 10;
 pub const SERVER_HEADER_LEN: usize = 9;
@@ -30,7 +31,7 @@ pub const WINDOW: u32 = 32;
 pub const LAG_UNKNOWN: u8 = 255;
 pub const MAX_OPEN_RECORD: usize = 512;
 
-const COOKIE_LABEL: &[u8] = b"cloudyday v1 cookie";
+const COOKIE_LABEL: &[u8] = b"cloudyday v2 cookie";
 
 pub mod kind {
     pub const HELLO: u8 = 0x01;
@@ -60,11 +61,13 @@ pub mod session_error {
     pub const UNSUPPORTED_VERSION: u8 = 0x02;
     pub const BUSY: u8 = 0x03;
     pub const HANDSHAKE_EXPIRED: u8 = 0x06;
+    /// A newer client took ownership of the reverse proxy. Do not reconnect.
+    pub const REPLACED: u8 = 0x07;
 
     pub fn is_known(reason: u8) -> bool {
         matches!(
             reason,
-            UNKNOWN_SESSION | UNSUPPORTED_VERSION | BUSY | HANDSHAKE_EXPIRED
+            UNKNOWN_SESSION | UNSUPPORTED_VERSION | BUSY | HANDSHAKE_EXPIRED | REPLACED
         )
     }
 }
@@ -82,7 +85,7 @@ pub mod status {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
-    /// The version bits are not 1; the server answers SESSION_ERROR.
+    /// Unsupported version; the server answers a public SESSION_ERROR.
     UnsupportedVersion,
     Malformed(&'static str),
 }
@@ -137,9 +140,11 @@ pub enum Frame {
         client_nonce: [u8; NONCE_LEN],
         server_nonce: [u8; NONCE_LEN],
         cookie: [u8; COOKIE_LEN],
+        proof: [u8; crate::crypto::PROOF_LEN],
     },
     Accept {
         session_id: u32,
+        proof: [u8; crate::crypto::PROOF_LEN],
     },
     Segment {
         stream: u32,
@@ -185,8 +190,8 @@ impl Frame {
         match self {
             Frame::Hello { .. } => NONCE_LEN,
             Frame::Challenge { .. } => NONCE_LEN + 4 + COOKIE_LEN,
-            Frame::CookieEcho { .. } => 2 * NONCE_LEN + COOKIE_LEN,
-            Frame::Accept { .. } => 4,
+            Frame::CookieEcho { .. } => 2 * NONCE_LEN + COOKIE_LEN + crate::crypto::PROOF_LEN,
+            Frame::Accept { .. } => 4 + crate::crypto::PROOF_LEN,
             Frame::Segment { payload, .. } => 8 + payload.len(),
             Frame::Fin { .. } => 8,
             Frame::StreamAck(_) => 14,
@@ -241,12 +246,17 @@ impl Frame {
                 client_nonce,
                 server_nonce,
                 cookie,
+                proof,
             } => {
                 out.extend_from_slice(client_nonce);
                 out.extend_from_slice(server_nonce);
                 out.extend_from_slice(cookie);
+                out.extend_from_slice(proof);
             }
-            Frame::Accept { session_id } => out.extend_from_slice(&session_id.to_be_bytes()),
+            Frame::Accept { session_id, proof } => {
+                out.extend_from_slice(&session_id.to_be_bytes());
+                out.extend_from_slice(proof);
+            }
             Frame::Segment {
                 stream,
                 seq,
@@ -299,17 +309,19 @@ impl Frame {
                 }
             }
             kind::COOKIE_ECHO => {
-                exact(2 * NONCE_LEN + COOKIE_LEN)?;
+                exact(2 * NONCE_LEN + COOKIE_LEN + crate::crypto::PROOF_LEN)?;
                 Frame::CookieEcho {
                     client_nonce: array(body),
                     server_nonce: array(&body[16..]),
                     cookie: array(&body[32..]),
+                    proof: array(&body[52..]),
                 }
             }
             kind::ACCEPT => {
-                exact(4)?;
+                exact(4 + crate::crypto::PROOF_LEN)?;
                 Frame::Accept {
                     session_id: be32(body),
+                    proof: array(&body[4..]),
                 }
             }
             kind::SEGMENT => {
@@ -403,11 +415,14 @@ impl Envelope {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
-        let flags = if self.more_pending {
+        let mut flags = if self.more_pending {
             FLAG_MORE_PENDING
         } else {
             0
         };
+        if matches!(self.frames.as_slice(), [Frame::SessionError { .. }]) {
+            flags |= FLAG_PLAIN_ERROR;
+        }
         out.push(VERSION << 5 | flags);
         out.extend_from_slice(&self.session_id.to_be_bytes());
         out.extend_from_slice(&self.exchange_id.to_be_bytes());
@@ -420,7 +435,7 @@ impl Envelope {
         out
     }
 
-    /// Parse and validate an envelope travelling in `dir`, after XOR removal.
+    /// Parse and validate a public or already decrypted envelope travelling in `dir`.
     pub fn decode(data: &[u8], dir: Direction) -> Result<Envelope, WireError> {
         let header_len = match dir {
             Direction::ClientToServer => CLIENT_HEADER_LEN,
@@ -478,6 +493,9 @@ impl Envelope {
         if frames.iter().any(is_error) && frames.len() != 1 {
             return malformed("SESSION_ERROR must travel alone");
         }
+        if (flags & FLAG_PLAIN_ERROR != 0) != frames.iter().any(is_error) {
+            return malformed("public error flag must mark exactly one SESSION_ERROR");
+        }
         if session_id == 0 {
             if frames.len() != 1 || !(frames[0].is_handshake() || is_error(&frames[0])) {
                 return malformed("handshake envelope must carry one handshake frame");
@@ -506,29 +524,6 @@ pub fn peek_ids(data: &[u8]) -> Option<(u32, u32)> {
 pub fn response_evidence(exchange_id: u32, rx_lag: u8) -> Option<u32> {
     (rx_lag != LAG_UNKNOWN && rx_lag != 0 && u32::from(rx_lag) < exchange_id)
         .then(|| exchange_id - u32::from(rx_lag))
-}
-
-/// The shared repeating XOR key. Never printed.
-#[derive(Clone)]
-pub struct XorKey(Arc<[u8]>);
-
-impl XorKey {
-    pub fn new(bytes: Vec<u8>) -> Option<XorKey> {
-        (!bytes.is_empty()).then(|| XorKey(bytes.into()))
-    }
-
-    /// XOR a complete envelope in place, starting at key offset zero.
-    pub fn apply(&self, data: &mut [u8]) {
-        for (byte, k) in data.iter_mut().zip(self.0.iter().cycle()) {
-            *byte ^= k;
-        }
-    }
-}
-
-impl fmt::Debug for XorKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "XorKey(<{} bytes redacted>)", self.0.len())
-    }
 }
 
 /// Server cookie inputs other than the secret and expiry.
@@ -742,20 +737,10 @@ impl OpenResult {
 mod tests {
     use super::*;
 
-    pub(crate) fn hex(s: &str) -> Vec<u8> {
+    fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
             .map(|b| u8::from_str_radix(b, 16).unwrap())
             .collect()
-    }
-
-    fn key() -> XorKey {
-        XorKey::new(hex("5a a5 3c")).unwrap()
-    }
-
-    fn xored(data: &[u8]) -> Vec<u8> {
-        let mut out = data.to_vec();
-        key().apply(&mut out);
-        out
     }
 
     const SESSION: u32 = 0x01020304;
@@ -769,32 +754,30 @@ mod tests {
         })
     }
 
-    /// Encode, compare with the A.7 plain/XOR lines, and decode back.
-    fn check(env: &Envelope, plain: &str, xor: &str) {
-        let encoded = env.encode();
-        assert_eq!(encoded, hex(plain));
-        assert_eq!(xored(&encoded), hex(xor));
+    /// Codec round trip followed by encryption round trip for session traffic.
+    fn check(env: &Envelope) {
+        let mut encoded = env.encode();
+        assert_eq!(encoded.len(), env.encoded_len());
+        assert_eq!(encoded[0] >> 5, 2);
         let dir = if env.rx_lag.is_some() {
             Direction::ClientToServer
         } else {
             Direction::ServerToClient
         };
-        assert_eq!(&Envelope::decode(&xored(&hex(xor)), dir).unwrap(), env);
-    }
-
-    #[test]
-    fn empty_key_rejected() {
-        assert!(XorKey::new(Vec::new()).is_none());
-        assert_eq!(format!("{:?}", key()), "XorKey(<3 bytes redacted>)");
+        assert_eq!(&Envelope::decode(&encoded, dir).unwrap(), env);
+        if env.session_id != 0 && !matches!(env.frames.as_slice(), [Frame::SessionError { .. }]) {
+            let keys = crate::crypto::fixture_keys();
+            keys.apply(&mut encoded, dir).unwrap();
+            keys.apply(&mut encoded, dir).unwrap();
+            assert_eq!(&Envelope::decode(&encoded, dir).unwrap(), env);
+        }
     }
 
     #[test]
     fn v1_poll() {
-        check(
-            &Envelope::client(SESSION, 5, 1, vec![]),
-            "20 01 02 03 04 00 00 00 05 01",
-            "7a a4 3e 59 a1 3c 5a a5 39 5b",
-        );
+        let env = Envelope::client(SESSION, 5, 1, vec![]);
+        assert_eq!(env.encode(), hex("40 01 02 03 04 00 00 00 05 01"));
+        check(&env);
     }
 
     #[test]
@@ -812,11 +795,13 @@ mod tests {
                 },
             ],
         );
-        check(
-            &env,
-            "20 01 02 03 04 00 00 00 06 01 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e 10 0d 00 00 00 01 00 00 00 00 68 65 6c 6c 6f",
-            "7a a4 3e 59 a1 3c 5a a5 3a 5b b7 32 5a a5 3c 5b a5 3c 5a a6 3c 5a a5 3e 5a bb 2c 57 a5 3c 5a a4 3c 5a a5 3c 32 c0 50 36 ca",
+        assert_eq!(
+            env.encode(),
+            hex(
+                "40 01 02 03 04 00 00 00 06 01 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e 10 0d 00 00 00 01 00 00 00 00 68 65 6c 6c 6f"
+            )
         );
+        check(&env);
     }
 
     pub(crate) fn v3_cookie() -> [u8; COOKIE_LEN] {
@@ -837,56 +822,58 @@ mod tests {
     #[test]
     fn v3_handshake() {
         let cookie = v3_cookie();
+        let cn = std::array::from_fn(|i| i as u8);
+        let sn = std::array::from_fn(|i| (16 + i) as u8);
+        let input = CookieInput {
+            domain_wire: b"\x01t\x07example\x03com\x00",
+            client_nonce: &cn,
+            server_nonce: &sn,
+            u: 111,
+            d: 182,
+        };
+        let secret = crate::crypto::SharedSecret::new((0..32).collect()).unwrap();
+        let hello = Envelope::client(0, 1, 255, vec![Frame::Hello { client_nonce: cn }]);
+        let challenge = Envelope::server(
+            0,
+            1,
+            vec![Frame::Challenge {
+                server_nonce: sn,
+                u: 111,
+                d: 182,
+                cookie,
+            }],
+        );
+        let echo = Envelope::client(
+            0,
+            2,
+            255,
+            vec![Frame::CookieEcho {
+                client_nonce: cn,
+                server_nonce: sn,
+                cookie,
+                proof: secret.client_proof(&input, &cookie),
+            }],
+        );
+        let accept = Envelope::server(
+            0,
+            2,
+            vec![Frame::Accept {
+                session_id: SESSION,
+                proof: secret.server_proof(&input, &cookie, SESSION),
+            }],
+        );
         assert_eq!(
-            cookie.to_vec(),
-            hex("65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57")
-        );
-        let cn: [u8; 16] = std::array::from_fn(|i| i as u8);
-        let sn: [u8; 16] = std::array::from_fn(|i| 16 + i as u8);
-        check(
-            &Envelope::client(0, 1, 255, vec![Frame::Hello { client_nonce: cn }]),
-            "20 00 00 00 00 00 00 00 01 ff 01 10 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f",
-            "7a a5 3c 5a a5 3c 5a a5 3d a5 a4 2c 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55",
-        );
-        check(
-            &Envelope::server(
-                0,
-                1,
-                vec![Frame::Challenge {
-                    server_nonce: sn,
-                    u: 111,
-                    d: 182,
-                    cookie,
-                }],
+            (
+                hello.encoded_len(),
+                challenge.encoded_len(),
+                echo.encoded_len(),
+                accept.encoded_len()
             ),
-            "20 00 00 00 00 00 00 00 01 02 28 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 00 6f 00 b6 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57",
-            "7a a5 3c 5a a5 3c 5a a5 3d 58 8d 2c 4b b7 2f 4e b0 2a 4d bd 25 40 be 20 47 bb 23 5a ca 3c ec c0 6f ab bb ac 2d 17 4b fa 0e eb 9a 46 dd 4f f0 f8 63 94 6b",
+            (28, 51, 96, 47)
         );
-        check(
-            &Envelope::client(
-                0,
-                2,
-                255,
-                vec![Frame::CookieEcho {
-                    client_nonce: cn,
-                    server_nonce: sn,
-                    cookie,
-                }],
-            ),
-            "20 00 00 00 00 00 00 00 02 ff 03 34 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57",
-            "7a a5 3c 5a a5 3c 5a a5 3e a5 a6 08 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55 b5 2d 48 b6 28 4f b3 2b 42 bc 26 41 b9 21 44 ba 59 09 54 22 ca d2 8e 2d 05 97 8d 65 df bb b0 69 9e 9c 0d 0d",
-        );
-        check(
-            &Envelope::server(
-                0,
-                2,
-                vec![Frame::Accept {
-                    session_id: SESSION,
-                }],
-            ),
-            "20 00 00 00 00 00 00 00 02 04 04 01 02 03 04",
-            "7a a5 3c 5a a5 3c 5a a5 3e 5e a1 3d 58 a6 38",
-        );
+        for env in [&hello, &challenge, &echo, &accept] {
+            check(env);
+        }
     }
 
     #[test]
@@ -923,16 +910,13 @@ mod tests {
 
     #[test]
     fn v5_fin_envelopes() {
-        check(
-            &Envelope::client(SESSION, 7, 1, vec![Frame::Fin { stream: 1, seq: 32 }]),
-            "20 01 02 03 04 00 00 00 07 01 11 08 00 00 00 01 00 00 00 20",
-            "7a a4 3e 59 a1 3c 5a a5 3b 5b b4 34 5a a5 3c 5b a5 3c 5a 85",
-        );
-        check(
-            &Envelope::server(SESSION, 7, vec![ack(1, 33, 0, 0)]),
-            "20 01 02 03 04 00 00 00 07 12 0e 00 00 00 01 00 00 00 21 00 00 00 00 00 00",
-            "7a a4 3e 59 a1 3c 5a a5 3b 48 ab 3c 5a a5 3d 5a a5 3c 7b a5 3c 5a a5 3c 5a",
-        );
+        check(&Envelope::client(
+            SESSION,
+            7,
+            1,
+            vec![Frame::Fin { stream: 1, seq: 32 }],
+        ));
+        check(&Envelope::server(SESSION, 7, vec![ack(1, 33, 0, 0)]));
     }
 
     #[test]
@@ -940,11 +924,12 @@ mod tests {
         assert_eq!(response_evidence(1000, 254), Some(746));
         assert_eq!(response_evidence(1000, 255), None);
         assert_eq!(response_evidence(1001, 1), Some(1000));
-        check(
-            &Envelope::client(SESSION, 1000, 255, vec![ack(1, 3, 2, 30)]),
-            "20 01 02 03 04 00 00 03 e8 ff 12 0e 00 00 00 01 00 00 00 03 00 00 00 02 00 1e",
-            "7a a4 3e 59 a1 3c 5a a6 d4 a5 b7 32 5a a5 3c 5b a5 3c 5a a6 3c 5a a5 3e 5a bb",
-        );
+        check(&Envelope::client(
+            SESSION,
+            1000,
+            255,
+            vec![ack(1, 3, 2, 30)],
+        ));
         // Lag zero, and an exact lag reaching the exchange ID, are invalid.
         let mut bad = Envelope::client(SESSION, 1000, 1, vec![]).encode();
         bad[9] = 0;
@@ -963,84 +948,51 @@ mod tests {
             port: 443,
         };
         assert_eq!(open.encode(), hex("01 cb 00 71 07 01 bb"));
-        check(
-            &Envelope::client(
-                SESSION,
-                11,
-                1,
-                vec![Frame::Segment {
-                    stream: 1,
-                    seq: 0,
-                    payload: open.encode(),
-                }],
-            ),
-            "20 01 02 03 04 00 00 00 0b 01 10 0f 00 00 00 01 00 00 00 00 01 cb 00 71 07 01 bb",
-            "7a a4 3e 59 a1 3c 5a a5 37 5b b5 33 5a a5 3c 5b a5 3c 5a a5 3d 91 a5 4d 5d a4 87",
-        );
-        check(
-            &Envelope::server(
-                SESSION,
-                11,
-                vec![Frame::Reset {
-                    stream: 1,
-                    reason: reset::UNKNOWN_STREAM,
-                }],
-            ),
-            "20 01 02 03 04 00 00 00 0b 13 05 00 00 00 01 06",
-            "7a a4 3e 59 a1 3c 5a a5 37 49 a0 3c 5a a5 3d 5c",
-        );
+        check(&Envelope::client(
+            SESSION,
+            11,
+            1,
+            vec![Frame::Segment {
+                stream: 1,
+                seq: 0,
+                payload: open.encode(),
+            }],
+        ));
+        check(&Envelope::server(
+            SESSION,
+            11,
+            vec![Frame::Reset {
+                stream: 1,
+                reason: reset::UNKNOWN_STREAM,
+            }],
+        ));
     }
 
     #[test]
-    fn v8_retry_and_expired() {
-        let cn: [u8; 16] = std::array::from_fn(|i| i as u8);
-        let sn: [u8; 16] = std::array::from_fn(|i| 16 + i as u8);
-        let cookie = v3_cookie();
-        check(
-            &Envelope::client(
-                0,
-                3,
-                255,
-                vec![Frame::CookieEcho {
-                    client_nonce: cn,
-                    server_nonce: sn,
-                    cookie,
-                }],
-            ),
-            "20 00 00 00 00 00 00 00 03 ff 03 34 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f 65 53 f1 1e 90 77 b2 77 a0 ab d7 c0 e3 e1 15 55 c4 39 31 57",
-            "7a a5 3c 5a a5 3c 5a a5 3f a5 a6 08 5a a4 3e 59 a1 39 5c a2 34 53 af 37 56 a8 32 55 b5 2d 48 b6 28 4f b3 2b 42 bc 26 41 b9 21 44 ba 59 09 54 22 ca d2 8e 2d 05 97 8d 65 df bb b0 69 9e 9c 0d 0d",
+    fn public_errors_require_the_marker_and_travel_alone() {
+        let env = Envelope::server(
+            SESSION,
+            4,
+            vec![Frame::SessionError {
+                reason: session_error::HANDSHAKE_EXPIRED,
+            }],
         );
-        check(
-            &Envelope::server(
-                0,
-                3,
-                vec![Frame::Accept {
-                    session_id: SESSION,
-                }],
-            ),
-            "20 00 00 00 00 00 00 00 03 04 04 01 02 03 04",
-            "7a a5 3c 5a a5 3c 5a a5 3f 5e a1 3d 58 a6 38",
-        );
-        check(
-            &Envelope::server(
-                0,
-                4,
-                vec![Frame::SessionError {
-                    reason: session_error::HANDSHAKE_EXPIRED,
-                }],
-            ),
-            "20 00 00 00 00 00 00 00 04 20 01 06",
-            "7a a5 3c 5a a5 3c 5a a5 38 7a a4 3a",
-        );
+        check(&env);
+        let mut bytes = env.encode();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(bytes[0], 0x41);
+        bytes[0] &= !FLAG_PLAIN_ERROR;
+        assert!(Envelope::decode(&bytes, Direction::ServerToClient).is_err());
+        for flag in [FLAG_PLAIN_ERROR, FLAG_MORE_PENDING | FLAG_PLAIN_ERROR] {
+            let mut not_error = Envelope::server(SESSION, 4, vec![]).encode();
+            not_error[0] |= flag;
+            assert!(Envelope::decode(&not_error, Direction::ServerToClient).is_err());
+        }
     }
 
     #[test]
     fn v9_credit_repeat() {
-        check(
-            &Envelope::server(SESSION, 12, vec![ack(1, 32, 0, 8)]),
-            "20 01 02 03 04 00 00 00 0c 12 0e 00 00 00 01 00 00 00 20 00 00 00 00 00 08",
-            "7a a4 3e 59 a1 3c 5a a5 30 48 ab 3c 5a a5 3d 5a a5 3c 7a a5 3c 5a a5 3c 52",
-        );
+        check(&Envelope::server(SESSION, 12, vec![ack(1, 32, 0, 8)]));
     }
 
     #[test]
@@ -1050,7 +1002,7 @@ mod tests {
         let poll = Envelope::client(SESSION, 5, 1, vec![]).encode();
         assert!(Envelope::decode(&poll[..9], c2s).is_err());
         let mut v2 = poll.clone();
-        v2[0] = 0x40;
+        v2[0] = 0x20;
         assert_eq!(
             Envelope::decode(&v2, c2s),
             Err(WireError::UnsupportedVersion)
@@ -1085,7 +1037,11 @@ mod tests {
         }
         // Direction checks.
         let mut challenge_from_client = Envelope::client(0, 1, 255, vec![]).encode();
-        Frame::Accept { session_id: 1 }.encode(&mut challenge_from_client);
+        Frame::Accept {
+            session_id: 1,
+            proof: [0; 32],
+        }
+        .encode(&mut challenge_from_client);
         assert!(Envelope::decode(&challenge_from_client, c2s).is_err());
         // Placement: handshake frames only with session 0, and alone.
         let mut hello_in_session = Envelope::client(SESSION, 1, 255, vec![]).encode();

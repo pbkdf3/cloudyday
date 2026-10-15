@@ -26,8 +26,8 @@ const TYPE_SOA: u16 = 6;
 const CLASS_IN: u16 = 1;
 const RCODE_REFUSED: u16 = 5;
 
-/// The largest COOKIE_ECHO query and CHALLENGE response, which must fit.
-const LARGEST_HANDSHAKE_QUERY: usize = CLIENT_HEADER_LEN + 2 + 52;
+/// The authenticated COOKIE_ECHO query and largest handshake response must fit.
+const LARGEST_HANDSHAKE_QUERY: usize = CLIENT_HEADER_LEN + 2 + 52 + crate::crypto::PROOF_LEN;
 const HELLO_QUERY: usize = CLIENT_HEADER_LEN + 2 + 16;
 const LARGEST_HANDSHAKE_RESPONSE: usize = SERVER_HEADER_LEN + 2 + 40;
 
@@ -203,10 +203,10 @@ pub struct BuiltQuery {
     pub qname: String,
 }
 
-/// Build a TXT query carrying an already XORed envelope.
-pub fn build_query(id: u16, xored: &[u8], domain: &TunnelDomain) -> Option<BuiltQuery> {
-    let chars = base32_encode(xored);
-    if qname_len(xored.len(), domain.wire.len()) > MAX_NAME {
+/// Build a TXT query carrying the wire envelope (public handshake or ciphertext).
+pub fn build_query(id: u16, payload: &[u8], domain: &TunnelDomain) -> Option<BuiltQuery> {
+    let chars = base32_encode(payload);
+    if qname_len(payload.len(), domain.wire.len()) > MAX_NAME {
         return None;
     }
     let mut packet = Vec::with_capacity(HEADER_LEN + MAX_NAME + 4 + OPT_LEN);
@@ -317,7 +317,7 @@ impl Query<'_> {
             .then_some(prefix)
     }
 
-    /// Bytes of a decodable tunnel query (still XORed), per A.2: TXT, IN,
+    /// Wire bytes of a decodable tunnel query, per A.2: TXT, IN,
     /// canonical base32 labels, and at least a client header's worth.
     pub fn tunnel_payload(&self, prefix: usize) -> Option<Vec<u8>> {
         if self.qtype != TYPE_TXT || self.qclass != CLASS_IN || prefix == 0 {
@@ -361,17 +361,17 @@ impl Query<'_> {
         out
     }
 
-    /// The tunnel answer: one TXT record holding the XORed envelope. `None`
+    /// The tunnel answer: one TXT record holding the wire envelope. `None`
     /// if it would exceed 512 bytes, which is an internal error.
-    pub fn tunnel_response(&self, xored: &[u8]) -> Option<Vec<u8>> {
+    pub fn tunnel_response(&self, payload: &[u8]) -> Option<Vec<u8>> {
         let mut out = self.header(0, true, 1, 0);
-        let rdata_len = xored.len() + xored.len().div_ceil(255);
+        let rdata_len = payload.len() + payload.len().div_ceil(255);
         out.extend_from_slice(&[0xc0, 0x0c]);
         out.extend_from_slice(&TYPE_TXT.to_be_bytes());
         out.extend_from_slice(&CLASS_IN.to_be_bytes());
         out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&u16::try_from(rdata_len).ok()?.to_be_bytes());
-        for chunk in xored.chunks(255) {
+        for chunk in payload.chunks(255) {
             out.push(chunk.len() as u8);
             out.extend_from_slice(chunk);
         }
@@ -418,7 +418,7 @@ pub enum ResponseError {
 }
 
 /// Check a resolver response against the query name sent and return the
-/// concatenated TXT character strings (the XORed envelope).
+/// concatenated TXT character strings (the wire envelope).
 pub fn parse_response(packet: &[u8], qname: &str) -> Result<Vec<u8>, ResponseError> {
     use ResponseError::Malformed;
     let msg = Message::from_octets(packet).map_err(|_| Malformed)?;
@@ -458,7 +458,7 @@ fn name_eq(name: impl fmt::Display, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Envelope, Frame, StreamAck, XorKey};
+    use crate::wire::{Direction, Envelope, Frame, StreamAck};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
@@ -470,9 +470,14 @@ mod tests {
         TunnelDomain::parse("t.example.com").unwrap()
     }
 
-    fn xored(env: &Envelope) -> Vec<u8> {
+    fn encrypted(env: &Envelope) -> Vec<u8> {
         let mut data = env.encode();
-        XorKey::new(hex("5a a5 3c")).unwrap().apply(&mut data);
+        let dir = if env.rx_lag.is_some() {
+            Direction::ClientToServer
+        } else {
+            Direction::ServerToClient
+        };
+        crate::crypto::fixture_keys().apply(&mut data, dir).unwrap();
         data
     }
 
@@ -481,7 +486,7 @@ mod tests {
     fn v1_query() -> BuiltQuery {
         build_query(
             0x1234,
-            &xored(&Envelope::client(SESSION, 5, 1, vec![])),
+            &encrypted(&Envelope::client(SESSION, 5, 1, vec![])),
             &domain(),
         )
         .unwrap()
@@ -524,11 +529,11 @@ mod tests {
     #[test]
     fn v1_query_bytes() {
         let query = v1_query();
-        assert_eq!(query.qname, "pksd4wnbhrnkkok3.t.example.com");
+        assert_eq!(query.qname, "iaaqeayeaaaaabiz.t.example.com");
         assert_eq!(
             query.packet,
-            hex("12 34 01 00 00 01 00 00 00 00 00 01 10 70 6b 73
-                 64 34 77 6e 62 68 72 6e 6b 6b 6f 6b 33 01 74 07
+            hex("12 34 01 00 00 01 00 00 00 00 00 01 10 69 61 61
+                 71 65 61 79 65 61 61 61 61 61 62 69 7a 01 74 07
                  65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 10 00 01
                  00 00 29 04 d0 00 00 00 00 00 00")
         );
@@ -558,13 +563,13 @@ mod tests {
             ],
         );
         assert_eq!(
-            build_query(1, &xored(&v2), &domain()).unwrap().qname,
-            "pksd4wnbhrnkkos3w4zfvjj4lostywvghrnkkps2xmwfpjj4lksdywvfhqzmaub.wzi.t.example.com"
+            build_query(1, &encrypted(&v2), &domain()).unwrap().qname,
+            "iaaqeayeaaaaabvwlowso2igezgmstqif2fajvxt2g5nzuoe4vy7cifn2lk7fj3.jky.t.example.com"
         );
         let v6 = Envelope::client(SESSION, 1000, 255, vec![ack(3, 2, 30)]);
         assert_eq!(
-            build_query(1, &xored(&v6), &domain()).unwrap().qname,
-            "pksd4wnbhrnknvffw4zfvjj4lostywvghrnkkps2xm.t.example.com"
+            build_query(1, &encrypted(&v6), &domain()).unwrap().qname,
+            "iaaqeayeaaaah2huhk544rjw2saiq6rillghqlnxqm.t.example.com"
         );
     }
 
@@ -575,22 +580,22 @@ mod tests {
         let prefix = parsed.zone_prefix(&domain()).unwrap();
         assert_eq!(prefix, 1);
         let payload = parsed.tunnel_payload(prefix).unwrap();
-        assert_eq!(payload, xored(&Envelope::client(SESSION, 5, 1, vec![])));
+        assert_eq!(payload, encrypted(&Envelope::client(SESSION, 5, 1, vec![])));
         let response = parsed
-            .tunnel_response(&xored(&Envelope::server(SESSION, 5, vec![])))
+            .tunnel_response(&encrypted(&Envelope::server(SESSION, 5, vec![])))
             .unwrap();
         assert_eq!(
             response,
-            hex("12 34 85 00 00 01 00 01 00 00 00 01 10 70 6b 73
-                 64 34 77 6e 62 68 72 6e 6b 6b 6f 6b 33 01 74 07
+            hex("12 34 85 00 00 01 00 01 00 00 00 01 10 69 61 61
+                 71 65 61 79 65 61 61 61 61 61 62 69 7a 01 74 07
                  65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 10 00 01
-                 c0 0c 00 10 00 01 00 00 00 00 00 0a 09 7a a4 3e
-                 59 a1 3c 5a a5 39 00 00 29 04 d0 00 00 00 00 00
+                 c0 0c 00 10 00 01 00 00 00 00 00 0a 09 40 01 02
+                 03 04 00 00 00 05 00 00 29 04 d0 00 00 00 00 00
                  00")
         );
         assert_eq!(
             parse_response(&response, &query.qname).unwrap(),
-            hex("7a a4 3e 59 a1 3c 5a a5 39")
+            hex("40 01 02 03 04 00 00 00 05")
         );
     }
 
@@ -635,7 +640,7 @@ mod tests {
             ],
         );
         assert_eq!(max_query.encoded_len(), 147);
-        let built = build_query(7, &xored(&max_query), &d).unwrap();
+        let built = build_query(7, &encrypted(&max_query), &d).unwrap();
         let parsed = parse_query(&built.packet).unwrap();
         assert_eq!(parsed.question_len(), 259);
         let mut response = Envelope::server(
@@ -650,17 +655,17 @@ mod tests {
                 },
             ],
         );
-        let packet = parsed.tunnel_response(&xored(&response)).unwrap();
+        let packet = parsed.tunnel_response(&encrypted(&response)).unwrap();
         assert_eq!(packet.len(), 512);
         response.frames.push(Frame::SessionError { reason: 1 });
         assert!(
-            parsed.tunnel_response(&xored(&response)).is_none(),
+            parsed.tunnel_response(&encrypted(&response)).is_none(),
             "never exceeds 512"
         );
         // A two-string TXT envelope is reassembled in order.
         let poll = build_query(
             8,
-            &xored(&Envelope::client(SESSION, 7, 1, vec![ack.clone()])),
+            &encrypted(&Envelope::client(SESSION, 7, 1, vec![ack.clone()])),
             &d,
         )
         .unwrap();
@@ -671,9 +676,12 @@ mod tests {
             payload: vec![b; sizes.d],
         };
         let two = Envelope::server(SESSION, 7, vec![ack, seg(0, b'a'), seg(1, b'b')]);
-        let packet = parsed.tunnel_response(&xored(&two)).unwrap();
+        let packet = parsed.tunnel_response(&encrypted(&two)).unwrap();
         assert_eq!(packet.len(), 508);
-        assert_eq!(parse_response(&packet, &poll.qname).unwrap(), xored(&two));
+        assert_eq!(
+            parse_response(&packet, &poll.qname).unwrap(),
+            encrypted(&two)
+        );
     }
 
     #[test]
@@ -691,10 +699,18 @@ mod tests {
         let sizes = longest.sizes().unwrap();
         assert!(sizes.u >= 16 && sizes.d >= 16);
         assert!(
-            TunnelDomain::parse(&format!("{}.{}", "a".repeat(63), "b".repeat(63)))
+            TunnelDomain::parse(&format!("{}.{}", "a".repeat(63), "b".repeat(32)))
                 .unwrap()
                 .sizes()
                 .is_ok()
+        );
+        // v2's 32-byte authentication proof must fit even when data segments
+        // still have room. A domain accepted by v1 can now be too long.
+        assert!(
+            TunnelDomain::parse(&format!("{}.{}", "a".repeat(63), "b".repeat(33)))
+                .unwrap()
+                .sizes()
+                .is_err()
         );
         let near_max = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(63));
         assert!(TunnelDomain::parse(&near_max).unwrap().sizes().is_err());
@@ -795,7 +811,7 @@ mod tests {
     #[test]
     fn tunnel_names_are_canonical() {
         let d = domain();
-        let env = xored(&Envelope::client(
+        let env = encrypted(&Envelope::client(
             SESSION,
             6,
             1,

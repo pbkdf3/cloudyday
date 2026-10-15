@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use cloudyday::crypto::SharedSecret;
 use cloudyday::dns::TunnelDomain;
 use cloudyday::session::client::{Client, ClientOptions};
 use cloudyday::session::server::{Server, ServerOptions};
-use cloudyday::wire::XorKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -18,8 +18,8 @@ fn domain() -> TunnelDomain {
     TunnelDomain::parse("tunnel.example.net").unwrap()
 }
 
-fn key() -> XorKey {
-    XorKey::new(b"\x00e2e key\xff".to_vec()).unwrap()
+fn key() -> SharedSecret {
+    SharedSecret::new(vec![0x42; 32]).unwrap()
 }
 
 async fn start_server(allow_private: bool) -> SocketAddr {
@@ -27,6 +27,7 @@ async fn start_server(allow_private: bool) -> SocketAddr {
         domain: domain(),
         key: key(),
         allow_private,
+        reverse_socks: None,
     };
     let server = Server::bind("127.0.0.1:0".parse().unwrap(), options)
         .await
@@ -252,7 +253,7 @@ async fn wrong_key_never_connects() {
     let relay = start_relay(server, 0, 0).await;
     let options = ClientOptions {
         domain: domain(),
-        key: XorKey::new(b"other".to_vec()).unwrap(),
+        key: SharedSecret::new(vec![0x43; 32]).unwrap(),
     };
     let client = Client::bind("127.0.0.1:0".parse().unwrap(), relay, options)
         .await
@@ -267,4 +268,127 @@ async fn wrong_key_never_connects() {
     .await
     .expect("timed out");
     assert_eq!(code, 0x01);
+}
+
+async fn start_reverse_server(allow_private: bool) -> (SocketAddr, SocketAddr) {
+    // The real listener must not bind until a session exists. Reserve an unused
+    // port briefly so the test can discover its configured address beforehand.
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = probe.local_addr().unwrap();
+    drop(probe);
+    let server = Server::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        ServerOptions {
+            domain: domain(),
+            key: key(),
+            allow_private,
+            reverse_socks: Some(proxy),
+        },
+    )
+    .await
+    .unwrap();
+    let dns = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+    (dns, proxy)
+}
+
+async fn wait_for_proxy(proxy: SocketAddr) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if TcpStream::connect(proxy).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reverse SOCKS listener did not open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_socks_through_lossy_resolver() {
+    let (dns, proxy) = start_reverse_server(true).await;
+    assert!(
+        TcpStream::connect(proxy).await.is_err(),
+        "no listener before a client connects"
+    );
+    let relay = start_relay(dns, 10, 5).await;
+    let forward = start_client(relay).await; // No local SOCKS request needed.
+    wait_for_proxy(proxy).await;
+    let echo = start_echo().await;
+    // Both directions can carry concurrent streams and half-closes, without
+    // confusing stream IDs or starving either direction of its query budget.
+    let transfers = vec![
+        echo_through(proxy, echo, 30_000, 1),
+        echo_through(proxy, echo, 35_000, 2),
+        echo_through(forward, echo, 25_000, 3),
+    ];
+    timeout(Duration::from_secs(120), futures_join(transfers))
+        .await
+        .expect("reverse transfers timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_resolves_on_client_and_reaches_private_destinations() {
+    let (dns, proxy) = start_reverse_server(false).await;
+    let forward = start_client(dns).await;
+    wait_for_proxy(proxy).await;
+    let echo = start_echo().await;
+    timeout(Duration::from_secs(30), async {
+        // Server destination filtering still applies to the forward proxy, but
+        // reverse SOCKS deliberately allows the client's LAN and loopback.
+        let (code, _) = socks_connect(forward, &connect_ip(echo)).await;
+        assert_eq!(code, 0x02);
+        let (code, mut tcp) = socks_connect(proxy, &connect_name("localhost", echo.port())).await;
+        assert_eq!(code, 0);
+        tcp.write_all(b"reverse hostname").await.unwrap();
+        tcp.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        tcp.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"reverse hostname");
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (code, _) = socks_connect(proxy, &connect_ip(closed)).await;
+        assert_eq!(code, 0x05, "client's connection-refused status is relayed");
+    })
+    .await
+    .expect("reverse name/error test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newest_client_wins_and_old_client_does_not_reclaim_proxy() {
+    let (dns, proxy) = start_reverse_server(true).await;
+    let old_forward = start_client(dns).await;
+    wait_for_proxy(proxy).await;
+    let echo = start_echo().await;
+    let (code, mut old_connection) = timeout(
+        Duration::from_secs(15),
+        socks_connect(proxy, &connect_ip(echo)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    let new_forward = start_client(dns).await;
+    timeout(Duration::from_secs(15), async {
+        let mut byte = [0];
+        // Existing SOCKS connections belong to the displaced client and close.
+        match old_connection.read(&mut byte).await {
+            Ok(n) => assert_eq!(n, 0),
+            Err(e) => assert!(matches!(e.kind(), std::io::ErrorKind::ConnectionReset)),
+        }
+        // Give the old client's idle poll time to receive REPLACED.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (code, _) = socks_connect(old_forward, &connect_ip(echo)).await;
+        assert_eq!(
+            code, 0x01,
+            "displaced client must not reconnect automatically"
+        );
+        echo_through(proxy, echo, 1_000, 4).await;
+        echo_through(new_forward, echo, 1_000, 5).await;
+    })
+    .await
+    .expect("client replacement timed out");
 }

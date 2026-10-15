@@ -6,11 +6,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cloudyday::crypto::SharedSecret;
 use cloudyday::dns::TunnelDomain;
 use cloudyday::session::client::ClientCore;
 use cloudyday::session::server::{Action, BUFFER_LIMIT, ServerCore};
 use cloudyday::session::{Budget, Chunk, IoEvent, IoKind, WRITE_QUEUE, WriteCmd};
-use cloudyday::wire::{Host, OpenResult, Target, XorKey, status};
+use cloudyday::wire::{Host, OpenResult, Target, status};
 use tokio::sync::{Semaphore, mpsc};
 
 const UNIX_BASE: u64 = 1_700_000_000;
@@ -102,8 +103,8 @@ fn domain() -> TunnelDomain {
     TunnelDomain::parse("t.example.com").unwrap()
 }
 
-fn key() -> XorKey {
-    XorKey::new(b"simulation key".to_vec()).unwrap()
+fn key() -> SharedSecret {
+    SharedSecret::new(vec![0x5a; 32]).unwrap()
 }
 
 impl Sim {
