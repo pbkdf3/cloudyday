@@ -1,22 +1,16 @@
-//! Command line, key loading, logging, and startup.
+//! Command line, embedded key initialization, logging, and startup.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::crypto::{SECRET_MIN_LEN, SharedSecret};
 use crate::dns::TunnelDomain;
+use crate::embedded_key;
 use crate::session::client::{Client, ClientOptions};
 use crate::session::server::{Server, ServerOptions};
-/// New secrets contain 256 bits of OS randomness.
-pub const GENERATED_KEY_LEN: usize = SECRET_MIN_LEN;
-/// Default shared-secret file, relative to the working directory. Deliberately
-/// different from v1's xor.key: old XOR keys may already have been recovered.
-pub const DEFAULT_KEY_FILE: &str = "shared.key";
 
 #[derive(Parser)]
 #[command(
@@ -39,16 +33,15 @@ struct Cli {
 enum Command {
     /// Answer tunnel queries as the domain's authoritative DNS server
     Server {
-        /// Tunnel domain delegated to this server
-        #[arg(long)]
-        domain: String,
+        /// Tunnel domain delegated to this server (required unless --genkey)
+        #[arg(long, required_unless_present = "genkey")]
+        domain: Option<String>,
         /// UDP address for DNS
         #[arg(long, default_value = "0.0.0.0:53")]
         listen: SocketAddr,
-        /// Shared-secret file (raw random bytes, at least 32). Without this
-        /// option, shared.key is used and generated if missing
-        #[arg(long, alias = "xor-key-file")]
-        key_file: Option<PathBuf>,
+        /// Embed a new random key in this executable (replacing any old key), then exit
+        #[arg(long)]
+        genkey: bool,
         /// Allow loopback, private, and other internal destinations
         #[arg(long)]
         allow_private_destinations: bool,
@@ -67,10 +60,6 @@ enum Command {
         /// SOCKS5 listen address
         #[arg(long, default_value = "127.0.0.1:1080")]
         listen: SocketAddr,
-        /// Shared-secret file (raw random bytes, at least 32); a copy of
-        /// the server's secret file [default: shared.key]
-        #[arg(long, alias = "xor-key-file")]
-        key_file: Option<PathBuf>,
     },
 }
 
@@ -96,60 +85,6 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// Read the shared secret as raw bytes, without trimming.
-pub fn load_key(path: &Path) -> Result<SharedSecret, String> {
-    let bytes = std::fs::read(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => format!(
-            "shared-secret file {} not found; copy the server's secret file there or pass --key-file",
-            path.display()
-        ),
-        _ => format!("cannot read shared-secret file {}: {e}", path.display()),
-    })?;
-    SharedSecret::new(bytes).ok_or_else(|| format!("shared-secret file {} is empty or shorter than {SECRET_MIN_LEN} bytes; use a random secret, not a password", path.display()))
-}
-
-/// Write a new random key to `path`, owner-readable only. Never overwrites
-/// an existing file.
-pub fn generate_key(path: &Path) -> Result<(), String> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut key = vec![0u8; GENERATED_KEY_LEN];
-    getrandom::fill(&mut key).map_err(|e| format!("cannot generate shared secret: {e}"))?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("cannot create shared-secret file {}: {e}", path.display()))?;
-    file.write_all(&key)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("cannot write shared-secret file {}: {e}", path.display()))
-}
-
-/// The server's secret: an explicit file, or generated/reused shared.key.
-pub fn server_key(path: Option<&Path>) -> Result<(SharedSecret, bool), String> {
-    let Some(path) = path else {
-        return load_or_create_key(Path::new(DEFAULT_KEY_FILE));
-    };
-    Ok((load_key(path)?, false))
-}
-
-fn load_or_create_key(path: &Path) -> Result<(SharedSecret, bool), String> {
-    let created = !path.exists();
-    if created {
-        generate_key(path)?;
-    }
-    Ok((load_key(path)?, created))
-}
-
-/// The client's secret: the given file or shared.key. Never created.
-pub fn client_key(path: Option<&Path>) -> Result<SharedSecret, String> {
-    load_key(path.unwrap_or(Path::new(DEFAULT_KEY_FILE)))
-}
-
 fn parse_domain(domain: &str) -> Result<TunnelDomain, String> {
     let domain = TunnelDomain::parse(domain)?;
     domain.sizes()?;
@@ -164,25 +99,36 @@ fn warn_no_integrity() {
     );
 }
 
+fn report_generated_key() {
+    info!(
+        "embedded a new shared secret in this executable; securely copy the executable to the client"
+    );
+    warn!(
+        "executable replaced with mode 0700; file capabilities were not preserved; reapply setcap if needed"
+    );
+}
+
 fn run(command: Command) -> Result<(), String> {
+    // Key-only operation must not require a domain, a Tokio runtime, or sockets.
+    if matches!(&command, Command::Server { genkey: true, .. }) {
+        embedded_key::server(true)?;
+        report_generated_key();
+        return Ok(());
+    }
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| format!("cannot start runtime: {e}"))?;
     let result = match command {
         Command::Server {
             domain,
             listen,
-            key_file,
+            genkey: _,
             allow_private_destinations,
             reverse_socks,
         } => {
-            let domain = parse_domain(&domain)?;
-            let (key, created) = server_key(key_file.as_deref())?;
+            let domain = parse_domain(domain.as_deref().ok_or("--domain is required")?)?;
+            let (key, created) = embedded_key::server(false)?;
             if created {
-                info!(
-                    path = DEFAULT_KEY_FILE,
-                    bytes = GENERATED_KEY_LEN,
-                    "generated a new shared secret; copy this file to the client"
-                );
+                report_generated_key();
             }
             warn_no_integrity();
             if allow_private_destinations {
@@ -211,10 +157,9 @@ fn run(command: Command) -> Result<(), String> {
             domain,
             resolver,
             listen,
-            key_file,
         } => {
             let domain = parse_domain(&domain)?;
-            let key = client_key(key_file.as_deref())?;
+            let key = embedded_key::load()?;
             warn_no_integrity();
             warn!(
                 "the client always supports reverse SOCKS: the server can dial destinations on this client's network"
@@ -248,159 +193,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_loading() {
-        let dir = std::env::temp_dir().join(format!("cloudyday-key-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let empty = dir.join("empty");
-        std::fs::write(&empty, b"").unwrap();
-        assert!(load_key(&empty).unwrap_err().contains("empty"));
-        assert!(
-            load_key(&dir.join("missing"))
-                .unwrap_err()
-                .contains("not found")
-        );
-        let raw = dir.join("raw");
-        std::fs::write(&raw, b" key\n").unwrap();
-        assert!(load_key(&raw).unwrap_err().contains("shorter"));
-        // Exactly 32 raw bytes including spaces and a trailing newline; a
-        // trimming loader would incorrectly reject this file.
-        let mut bytes = [b' '; 32];
-        bytes[31] = b'\n';
-        std::fs::write(&raw, bytes).unwrap();
-        assert!(load_key(&raw).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn key_generation() {
-        let dir = std::env::temp_dir().join(format!("cloudyday-gen-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("key");
-        generate_key(&path).unwrap();
-        let first = std::fs::read(&path).unwrap();
-        assert_eq!(first.len(), GENERATED_KEY_LEN);
-        assert!(load_key(&path).is_ok());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        let err = generate_key(&path).unwrap_err();
-        assert!(err.contains("cannot create"), "{err}");
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            first,
-            "existing key untouched"
-        );
-        let other = dir.join("other");
-        generate_key(&other).unwrap();
-        assert_ne!(std::fs::read(&other).unwrap(), first);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn default_key_file() {
-        let dir =
-            std::env::temp_dir().join(format!("cloudyday-default-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(DEFAULT_KEY_FILE);
-        // Missing: the client errors and creates nothing; the server creates it.
-        assert!(load_key(&path).unwrap_err().contains("not found"));
-        assert!(!path.exists());
-        let (_, created) = load_or_create_key(&path).unwrap();
-        assert!(created);
-        let first = std::fs::read(&path).unwrap();
-        assert_eq!(first.len(), GENERATED_KEY_LEN);
-        // Present: reused unchanged.
-        let (_, created) = load_or_create_key(&path).unwrap();
-        assert!(!created);
-        assert_eq!(std::fs::read(&path).unwrap(), first);
-        // An explicit path is never created.
-        let explicit = dir.join("explicit.key");
-        assert!(server_key(Some(&explicit)).is_err());
-        assert!(client_key(Some(&explicit)).is_err());
-        assert!(!explicit.exists());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn cli_parses() {
-        Cli::command_for_test();
-    }
-
-    impl Cli {
-        fn command_for_test() {
-            use clap::CommandFactory;
-            Cli::command().debug_assert();
-            let cli = Cli::try_parse_from([
-                "cloudyday",
-                "client",
-                "--domain",
-                "t.example.com",
-                "--resolver",
-                "192.0.2.53:53",
-                "--key-file",
-                "/k",
-            ])
-            .unwrap();
-            let Command::Client { listen, .. } = cli.command else {
-                panic!()
-            };
-            assert_eq!(listen, "127.0.0.1:1080".parse().unwrap());
-            let alias = Cli::try_parse_from([
-                "cloudyday",
-                "server",
-                "--domain",
-                "t.example.com",
-                "--xor-key-file",
-                "/legacy-spelling",
-            ])
-            .unwrap();
-            assert!(
-                matches!(alias.command, Command::Server { key_file: Some(path), .. }
-                if path == Path::new("/legacy-spelling"))
-            );
-            let cli =
-                Cli::try_parse_from(["cloudyday", "server", "--domain", "t.example.com"]).unwrap();
-            let Command::Server {
-                key_file,
-                reverse_socks,
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let cli = Cli::try_parse_from([
+            "cloudyday",
+            "client",
+            "--domain",
+            "t.example.com",
+            "--resolver",
+            "192.0.2.53:53",
+        ])
+        .unwrap();
+        let Command::Client { listen, .. } = cli.command else {
+            panic!()
+        };
+        assert_eq!(listen, "127.0.0.1:1080".parse().unwrap());
+        let cli = Cli::try_parse_from(["cloudyday", "server", "--genkey"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                domain: None,
+                genkey: true,
                 ..
-            } = cli.command
-            else {
-                panic!()
-            };
-            assert_eq!(key_file, None, "key file optional");
-            assert_eq!(reverse_socks, None);
-            let cli = Cli::try_parse_from([
-                "cloudyday",
-                "server",
-                "--domain",
-                "t.example.com",
-                "--reverse-socks",
-            ])
-            .unwrap();
-            let Command::Server { reverse_socks, .. } = cli.command else {
-                panic!()
-            };
-            assert_eq!(reverse_socks, Some("127.0.0.1:1080".parse().unwrap()));
-            let cli = Cli::try_parse_from([
-                "cloudyday",
-                "server",
-                "--domain",
-                "t.example.com",
-                "--reverse-socks",
+            }
+        ));
+        assert!(Cli::try_parse_from(["cloudyday", "server"]).is_err());
+        assert!(Cli::try_parse_from(["cloudyday", "client", "--genkey"]).is_err());
+        let cli =
+            Cli::try_parse_from(["cloudyday", "server", "--domain", "t.example.com"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                genkey: false,
+                reverse_socks: None,
+                ..
+            }
+        ));
+        for (args, expected) in [
+            (
+                vec![
+                    "cloudyday",
+                    "server",
+                    "--domain",
+                    "t.example.com",
+                    "--reverse-socks",
+                ],
+                "127.0.0.1:1080",
+            ),
+            (
+                vec![
+                    "cloudyday",
+                    "server",
+                    "--domain",
+                    "t.example.com",
+                    "--reverse-socks",
+                    "127.0.0.1:2080",
+                ],
                 "127.0.0.1:2080",
-            ])
-            .unwrap();
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
             let Command::Server { reverse_socks, .. } = cli.command else {
                 panic!()
             };
-            assert_eq!(reverse_socks, Some("127.0.0.1:2080".parse().unwrap()));
+            assert_eq!(reverse_socks, Some(expected.parse().unwrap()));
+        }
+        for option in ["--key-file", "--xor-key-file", "--generate-xor-key"] {
             assert!(
-                Cli::try_parse_from(["cloudyday", "server", "--domain", "x", "--generate-xor-key"])
+                Cli::try_parse_from(["cloudyday", "server", "--domain", "x", option, "/k"])
                     .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "cloudyday",
+                    "client",
+                    "--domain",
+                    "x",
+                    "--resolver",
+                    "127.0.0.1:53",
+                    option,
+                    "/k"
+                ])
+                .is_err()
             );
         }
     }

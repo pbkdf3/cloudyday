@@ -4,6 +4,7 @@ pub mod arq;
 pub mod cli;
 pub mod crypto;
 pub mod dns;
+mod embedded_key;
 pub mod filter;
 pub mod session;
 pub mod socks;

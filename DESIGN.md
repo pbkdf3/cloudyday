@@ -33,12 +33,13 @@ One executable, with `client` and `server` subcommands:
 ## 2. CLI and operational defaults
 
 ```sh
-cloudyday server --domain t.example.com --listen 0.0.0.0:53 --key-file /path/to/secret
-cloudyday client --domain t.example.com --resolver 192.0.2.53:53 --key-file /path/to/secret
+cloudyday server --domain t.example.com --listen 0.0.0.0:53
+cloudyday client --domain t.example.com --resolver 192.0.2.53:53
+cloudyday server --genkey   # create/rotate the embedded key, then exit
 
-# Both sides require the same raw high-entropy shared secret (at least 32 bytes).
-# Default: shared.key. The server generates 32 random bytes if missing; the
-# client never generates a secret. Explicit paths must already exist.
+# Both sides require the same 32-byte random secret embedded in the executable.
+# First server start generates it if absent; the client never generates one.
+# Securely copy the keyed executable to the client. No external key files.
 
 # Server only, off by default:
 # --allow-private-destinations
@@ -60,12 +61,31 @@ SOCKS status `0x02` (connection not allowed by ruleset).
 `--allow-private-destinations` disables this filter for deliberate use, such as
 reaching services on the server's own network.
 
-No configuration file or exposed ARQ/worker/queue tuning. Read the shared secret
-as raw bytes, without trimming. Reject missing secrets or files shorter than
-32 bytes. Generate secrets from OS randomness, not passwords: proofs permit
-offline guesses. Never log secrets, session keys, cookies, proofs, or tunneled
-content. Upgrade both endpoints together and generate a fresh secret rather
-than reusing an old XOR key. The legacy --xor-key-file alias does not enable XOR.
+No configuration file or exposed ARQ/worker/queue tuning. On Linux, read the
+running inode through `/proc/self/exe`. Its trailer is exactly 32 raw key bytes
+followed by a fixed 32-byte marker (hex):
+`29d931f321c2dfe2d1459863bc8fd35bd0926386c07d02a85598b50abab058d8`.
+This marker was generated randomly once and is constant across builds; it is
+not a secret. The complete trailer is 64 bytes. An absent trailer is an error for
+clients. The server reuses an existing trailer, or generates one if absent.
+`server --genkey` always creates/replaces the key and exits without requiring
+`--domain`, a runtime, or sockets. There is no key-file option or legacy alias.
+
+Generate keys from OS randomness, not passwords: proofs permit offline guesses.
+Serialize updates with a lock on the executable's directory, copy the original
+binary without any existing trailer to a same-directory temporary file, append
+the new trailer, sync, and atomically rename over the executable. Refuse updates
+if the path no longer names the running inode. Set mode 0700; do not preserve
+capabilities, setuid/setgid, ownership, or extended attributes. Sync the directory
+after replacement and clean up temporary files on failure. Write permission on
+the directory is required only for initialization/rotation. The current process
+uses the new key from memory; subsequent launches read the new inode. Existing
+processes retain their old keys. Apply `setcap` after generation/rotation.
+
+Anyone able to read the executable can extract the key. Securely redistribute
+it after rotation and restart peers; finish stripping/building before embedding.
+Never log secrets, session keys, cookies, proofs, or tunneled content. Upgrade
+both endpoints together rather than reusing an old XOR key.
 
 The domain must be delegated to the server, whose UDP DNS port must be reachable
 by the resolver. This is a TCP proxy, not an IP VPN. The server is not a generic

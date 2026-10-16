@@ -60,26 +60,36 @@ domain you control.
    Keep the tunnel domain short: every byte of it reduces the payload each
    query can carry. Overly long domains are rejected at startup.
 
-2. **Share a secret.** On its first start the server creates `shared.key`
-   in its working directory with 32 random bytes (mode 0600), and reuses it
-   on later starts. Copy it securely to the client's working directory.
-   Both sides need the same secret; the client never creates one and exits
-   if `shared.key` is missing.
+2. **Initialize and share the executable (Linux).** On its first start the
+   server generates 32 random bytes and embeds them in its executable's
+   trailer. Later starts reuse that key. Securely copy the resulting executable
+   to the client (with a matching CPU architecture), and keep both copies private.
+   The client never generates a key and refuses an executable without a trailer.
+   There are no key files or `--key-file` / `--xor-key-file` options.
 
-   To use another file, pass `--key-file PATH` to either side. An explicit
-   path must already exist and contain at least 32 raw random bytes (no
-   trimming). Use a high-entropy secret, not a password: handshake proofs
-   permit offline guesses. For example:
+   To initialize without starting the server, or to **rotate** an existing key:
 
    ```sh
-   umask 077
-   head -c 32 /dev/urandom > cloudyday.key
+   cp target/release/cloudyday ./cloudyday
+   ./cloudyday server --genkey
    ```
 
-   **Migration:** protocol v2 is incompatible with the old XOR protocol;
-   update both endpoints. Generate a fresh secret rather than reusing an
-   old `xor.key`, which may have been exposed by XOR traffic. The old
-   `--xor-key-file` spelling is accepted as an alias, but never enables XOR.
+   `--genkey` always generates a new key and exits; no domain or sockets are
+   required. After rotation, restart the server and securely redistribute the
+   executable to every client. Already running processes retain their old key.
+
+   Initialization and rotation require write permission on the executable's
+   directory. The program atomically replaces its executable with a private
+   copy (mode 0700); it does not write to the running inode. File capabilities,
+   ownership, and other extended attributes are not preserved. Initialize
+   **before** applying `setcap`. Normal starts with an existing key need no
+   write permission. This feature requires Linux with `/proc` mounted.
+
+   **Anyone who can read the executable can extract the secret.** Protect it
+   like a key file, including during transfer and backup. Finish building and
+   stripping before initialization: rebuilding or processing the binary may
+   discard the trailer. Protocol v2 remains incompatible with the old XOR
+   protocol; update both endpoints rather than reusing old XOR keys.
 
 ## Run
 
@@ -89,14 +99,18 @@ domain you control.
 cloudyday server --domain t.example.com
 ```
 
-This uses (or creates) `shared.key` in the current directory.
+This reuses the embedded key, or generates and embeds one if absent.
 
 It listens on `0.0.0.0:53` by default (`--listen` to change). Binding port 53
-needs privileges; rather than running as root you can grant the capability:
+needs privileges; rather than running as root you can grant the capability
+**after** initializing the key:
 
 ```sh
-sudo setcap cap_net_bind_service=+ep target/release/cloudyday
+./cloudyday server --genkey
+sudo setcap cap_net_bind_service=+ep ./cloudyday
 ```
+
+Key rotation replaces the file and drops this capability; reapply it afterward.
 
 By default the server refuses loopback, private, link-local (including cloud
 metadata), CGNAT, multicast, and other internal destinations, plus its own
@@ -113,7 +127,8 @@ never forwards queries.
 cloudyday client --domain t.example.com --resolver 1.1.1.1:53
 ```
 
-Run it in a directory holding a copy of the server's `shared.key`.
+Run a securely transferred copy of the server's keyed executable; the working
+directory does not matter.
 `--resolver` is any recursive resolver that can reach your server. The SOCKS5
 proxy listens on `127.0.0.1:1080` by default (`--listen` to change; it has no
 authentication, so a non-loopback address prints a warning).
@@ -190,7 +205,7 @@ directly instead of through a resolver:
 ```sh
 cloudyday server --domain t.example.com --listen 127.0.0.1:5353 \
     --allow-private-destinations &
-sleep 1   # the server creates shared.key; the client reads the same file
+sleep 1   # the server embeds a key; the client launches the replaced executable
 cloudyday client --domain t.example.com --resolver 127.0.0.1:5353 \
     --listen 127.0.0.1:1080 &
 curl --socks5-hostname 127.0.0.1:1080 https://example.org/
