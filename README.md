@@ -50,6 +50,24 @@ cargo build --release --target aarch64-unknown-linux-musl
 
 The binaries are `target/<target>/release/cloudyday`.
 
+### macOS binary (Apple Silicon)
+
+macOS has no fully static executables: every program links `libSystem`
+dynamically. The macOS build depends only on libraries in `/usr/lib` that ship
+with the OS, and needs macOS 13 or later. It is cross-built from Linux with
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild), which uses
+[zig](https://ziglang.org/) as the linker, so no Xcode or macOS SDK is needed:
+
+```sh
+rustup target add aarch64-apple-darwin   # only needed once
+cargo install --locked cargo-zigbuild    # only needed once; zig must be on PATH
+
+cargo zigbuild --release --target aarch64-apple-darwin
+```
+
+A warning that `xcrun` could not find the SDK is expected and harmless. The
+linker gives the binary an ad-hoc code signature, which Apple Silicon requires.
+
 ## Set up
 
 You need a server with a public IP whose UDP port 53 is reachable, and a

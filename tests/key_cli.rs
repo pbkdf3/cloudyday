@@ -1,5 +1,5 @@
 //! Exercise embedded-key loading from the actual running executable.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;
