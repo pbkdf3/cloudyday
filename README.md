@@ -1,21 +1,17 @@
-# Cloudyday
+# cloudyday
 
 A small SOCKS5 TCP proxy carried over DNS. Applications connect to a local
 SOCKS5 port; the client carries their TCP streams inside DNS TXT queries sent
 to an ordinary recursive resolver, and the server — the authoritative name
 server for a delegated tunnel domain — dials the destinations.
 
+Yes, there are many other tools already named cloudyday.  Don't care.
+
 ```text
-app -> SOCKS5 (client) -> recursive resolver -> cloudyday server -> destination
+app -> SOCKS5 (cloudyday client) -> recursive resolver -> cloudyday server -> destination
 ```
 
 See [DESIGN.md](DESIGN.md) for the protocol.
-
-> **Security warning.** The handshake authenticates both peers using a shared
-> secret. Session traffic uses **plain ChaCha20 without authentication tags**:
-> active attackers can modify ciphertext or forge public session errors. There
-> is no forward secrecy, and routing metadata remains visible. Use TLS inside
-> the tunnel for sensitive traffic. SOCKS listeners themselves have no authentication.
 
 ## Build
 
@@ -25,8 +21,18 @@ Requires a recent stable Rust toolchain (developed with Rust 1.99, edition
 ```sh
 cargo build --release
 ```
-
 The binary is `target/release/cloudyday`.
+
+or, (recommended), build static binaries for selected platforms,
+the same key is applied to all binaries built, so you can easily
+run server and client on different platforms.
+
+```sh
+./build.sh
+```
+The keyed binaries end up as target/[arch]/
+
+
 
 ### Static Linux binaries (x86_64 and ARM64)
 
@@ -36,7 +42,8 @@ the `rust-lld` that ships with Rust, so no cross C toolchain is needed, and
 either architecture can be built from the other:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl # only needed once
+
 cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 ```
@@ -56,6 +63,8 @@ domain you control.
    t.example.com.      IN NS  ns-t.example.com.
    ns-t.example.com.   IN A   203.0.113.10    ; the server's public IP
    ```
+   **If using cloudflare, make sure to toggle "DNS Proxy" OFF whenever it 
+   is an option when adding the records.  Otherwise this will not work.**
 
    Keep the tunnel domain short: every byte of it reduces the payload each
    query can carry. Overly long domains are rejected at startup.
@@ -74,22 +83,15 @@ domain you control.
    ```sh
    python3 rekey.py ./cloudyday-x86_64 ./cloudyday-aarch64
    ```
-
    Securely copy the appropriate keyed executable to each client and keep all
    copies private. Both server and client refuse to start without an embedded
-   key and tell you to add one with `rekey.py`; the program itself never creates
-   or changes keys. There are no key files or `--key-file` / `--xor-key-file`
-   options.
+   key and tell you to add one with `rekey.py`.
 
-   Run `rekey.py` again to rotate the key, then restart the server and securely
+Run `rekey.py` again to rotate the key, then restart the server and securely
    redistribute the executable to every client. Key the finished binary after
    building and stripping, and before applying `setcap`; modifying an executable
    can discard its trailer or file capabilities.
 
-   **Anyone who can read the executable can extract the secret.** Protect it
-   like a key file, including during transfer and backup. Embedded-key loading
-   requires Linux with `/proc` mounted. Protocol v2 remains incompatible with
-   the old XOR protocol; update both endpoints rather than reusing old XOR keys.
 
 ## Run
 
@@ -138,10 +140,10 @@ Point applications at the SOCKS5 proxy. Use remote name resolution so the
 server resolves hostnames:
 
 ```sh
-curl --socks5-hostname 127.0.0.1:1080 https://example.org/
+curl -x socks5h://127.0.0.1:1080 https://ip.me/
 ```
 
-Only SOCKS5 CONNECT (TCP) is supported.
+Only SOCKS5 CONNECT (TCP) is supported.  UDP forwarding is not currently supported.
 
 ### Reverse SOCKS (optional, server-controlled)
 
@@ -152,11 +154,11 @@ on the server:
 cloudyday server --domain t.example.com --reverse-socks
 cloudyday client --domain t.example.com --resolver 1.1.1.1:53
 # On the server, once the client has connected:
-curl --socks5-hostname 127.0.0.1:1080 https://example.org/
+curl --socks5-hostname 127.0.0.1:1080 https://ip.me/
 ```
 
 ```text
-app -> SOCKS5 (server) -> DNS tunnel -> cloudyday client -> destination
+app -> SOCKS5 (cloudyday server) -> DNS tunnel -> cloudyday client -> destination
 ```
 
 `--reverse-socks` defaults to `127.0.0.1:1080`; supply an address to change it,
@@ -165,33 +167,12 @@ client establishes a session and closes when that session expires. A bind
 failure stops the server with an error. The normal forward proxy remains
 available (use different SOCKS ports when running both sides on one host).
 
-Only one client is allowed while reverse SOCKS is enabled: **the newest
-established session wins**, closing the previous client's tunnel connections.
-The displaced client stops reconnecting automatically; restart it to reclaim
-the proxy. Handshake retransmissions do not count as a new connection.
-
-Clients connect automatically at startup and always support reverse SOCKS,
-without a client-side flag. Hostnames are resolved on the client. Reverse
-SOCKS intentionally allows its loopback and private-network destinations;
-`--allow-private-destinations` still controls only forward dialing on the
-server. **Trust the server before connecting a client:** it can access the
-client's network. The shared secret authenticates the tunnel handshake,
-not individual packets or local SOCKS users. Use updated binaries on both sides.
 
 ### Encryption and authentication
 
-HELLO/CHALLENGE exchange fresh nonces and a server cookie. COOKIE_ECHO carries
-an HMAC-SHA256 client proof; ACCEPT carries a server proof bound to the assigned
-session. HKDF-SHA256 derives independent keys for each direction from the shared
-secret and handshake transcript. Proofs are public, but are not encryption keys.
+A pre-shared key is used for authentication.  The protocol uses HMAC-SHA256 and nonces to securely authenticate without leaking the key.
 
-Established envelopes retain their existing nine-byte routing prefix and
-ChaCha20-encrypt everything after it, including stream opening records and data.
-The session and exchange IDs determine the nonce: **no extra nonce bytes,
-no tag, and zero additional per-envelope bytes**. Handshakes and marked session
-errors are public. Duplicate queries replay cached ciphertext; counters never
-wrap. Authentication is checked before allocating a session or replacing a
-reverse-SOCKS owner. It is not checked per packet: tampering remains possible.
+HKDF-SHA256 is used to generate an ephemeral session key, chacha20 is used as a symmetric cipher.  
 
 ### Logging
 
