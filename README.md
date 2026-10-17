@@ -92,23 +92,21 @@ domain you control.
 
    ```sh
    cp target/release/cloudyday ./cloudyday
-   python3 rekey.py ./cloudyday
+   python3 rekey.py rekey ./cloudyday
    ```
 
    Run the script once with every architecture-specific binary if they must
    share a key; one invocation applies the same new key to every named file:
 
    ```sh
-   python3 rekey.py ./cloudyday-x86_64 ./cloudyday-aarch64
+   python3 rekey.py rekey ./cloudyday-x86_64 ./cloudyday-aarch64
    ```
    Securely copy the appropriate keyed executable to each client and keep all
    copies private. Both server and client refuse to start without an embedded
    key and tell you to add one with `rekey.py`.
 
-Run `rekey.py` again to rotate the key, then restart the server and securely
-   redistribute the executable to every client. Key the finished binary after
-   building and stripping, and before applying `setcap`; modifying an executable
-   can discard its trailer or file capabilities.
+   Key the finished binary after building and stripping, and before applying 
+   `setcap`; modifying an executable can discard its trailer or file capabilities.
 
 
 ## Run
@@ -127,7 +125,7 @@ needs privileges; rather than running as root you can grant the capability
 after adding the key:
 
 ```sh
-python3 rekey.py ./cloudyday
+python3 rekey.py rekey ./cloudyday
 sudo setcap cap_net_bind_service=+ep ./cloudyday
 ```
 
@@ -203,7 +201,7 @@ Both sides can run on one machine, with the client talking to the server
 directly instead of through a resolver:
 
 ```sh
-python3 rekey.py ./cloudyday
+python3 rekey.py rekey ./cloudyday
 ./cloudyday server --domain t.example.com --listen 127.0.0.1:5353 \
     --allow-private-destinations &
 sleep 1

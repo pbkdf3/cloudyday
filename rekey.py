@@ -17,8 +17,40 @@ def rekey(fname):
             print("no key found, adding")
             f.write(newkey + MAGIC)
 
-
+def writekey(fname, key):
+    with open(fname, "rb+") as f:
+        f.seek(-64, os.SEEK_END)
+        tr = f.read()
+        if tr[32:] == MAGIC:
+            f.seek(-64, os.SEEK_END)
+            f.write(key + MAGIC)
+        else:
+            f.write(key + MAGIC)
+            
+            
+def readkey(fname):
+    with open(fname, "rb") as f:
+        f.seek(-64, os.SEEK_END)
+        tr = f.read()
+        if tr[32:] == MAGIC:
+            print(tr[:32].hex())
+        else:
+            print("no key found")
+            
 if __name__=="__main__":
-    for fn in sys.argv[1:]:
-        rekey(fn)
+        if sys.argv[1]=='rekey':
+            for fn in sys.argv[2:]:
+                rekey(fn)
+        elif sys.argv[1]=='readkey':
+            for fn in sys.argv[2:]:
+                readkey(fn)
+        elif sys.argv[1]=='writekey':
+            key = bytes.fromhex(sys.stdin.read(64))
+            for fn in sys.argv[2:]:
+                writekey(fn, key)
+        else:
+            print('usage: ./rekey.py [rekey|readkey|writekey] file [file...]\nnormal use is to rekey all binaries to be used together at once')
+
+        
+        
     

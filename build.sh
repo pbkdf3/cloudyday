@@ -8,4 +8,5 @@ cargo build --release --target aarch64-unknown-linux-musl
 cargo zigbuild --release --target aarch64-apple-darwin
 
 # key all binaries with the same random key
-python3 rekey.py target/x86_64-unknown-linux-musl/release/cloudyday target/aarch64-unknown-linux-musl/release/cloudyday target/aarch64-apple-darwin/release/cloudyday
+./rekey.py rekey target/x86_64-unknown-linux-musl/release/cloudyday target/aarch64-unknown-linux-musl/release/cloudyday target/aarch64-apple-darwin/release/cloudyday
+
