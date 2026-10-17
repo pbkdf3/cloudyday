@@ -60,36 +60,36 @@ domain you control.
    Keep the tunnel domain short: every byte of it reduces the payload each
    query can carry. Overly long domains are rejected at startup.
 
-2. **Initialize and share the executable (Linux).** On its first start the
-   server generates 32 random bytes and embeds them in its executable's
-   trailer. Later starts reuse that key. Securely copy the resulting executable
-   to the client (with a matching CPU architecture), and keep both copies private.
-   The client never generates a key and refuses an executable without a trailer.
-   There are no key files or `--key-file` / `--xor-key-file` options.
-
-   To initialize without starting the server, or to **rotate** an existing key:
+2. **Key and share the executable (Linux).** After building, use `rekey.py` to
+   append a 32-byte random key to the executable:
 
    ```sh
    cp target/release/cloudyday ./cloudyday
-   ./cloudyday server --genkey
+   python3 rekey.py ./cloudyday
    ```
 
-   `--genkey` always generates a new key and exits; no domain or sockets are
-   required. After rotation, restart the server and securely redistribute the
-   executable to every client. Already running processes retain their old key.
+   Run the script once with every architecture-specific binary if they must
+   share a key; one invocation applies the same new key to every named file:
 
-   Initialization and rotation require write permission on the executable's
-   directory. The program atomically replaces its executable with a private
-   copy (mode 0700); it does not write to the running inode. File capabilities,
-   ownership, and other extended attributes are not preserved. Initialize
-   **before** applying `setcap`. Normal starts with an existing key need no
-   write permission. This feature requires Linux with `/proc` mounted.
+   ```sh
+   python3 rekey.py ./cloudyday-x86_64 ./cloudyday-aarch64
+   ```
+
+   Securely copy the appropriate keyed executable to each client and keep all
+   copies private. Both server and client refuse to start without an embedded
+   key and tell you to add one with `rekey.py`; the program itself never creates
+   or changes keys. There are no key files or `--key-file` / `--xor-key-file`
+   options.
+
+   Run `rekey.py` again to rotate the key, then restart the server and securely
+   redistribute the executable to every client. Key the finished binary after
+   building and stripping, and before applying `setcap`; modifying an executable
+   can discard its trailer or file capabilities.
 
    **Anyone who can read the executable can extract the secret.** Protect it
-   like a key file, including during transfer and backup. Finish building and
-   stripping before initialization: rebuilding or processing the binary may
-   discard the trailer. Protocol v2 remains incompatible with the old XOR
-   protocol; update both endpoints rather than reusing old XOR keys.
+   like a key file, including during transfer and backup. Embedded-key loading
+   requires Linux with `/proc` mounted. Protocol v2 remains incompatible with
+   the old XOR protocol; update both endpoints rather than reusing old XOR keys.
 
 ## Run
 
@@ -99,18 +99,19 @@ domain you control.
 cloudyday server --domain t.example.com
 ```
 
-This reuses the embedded key, or generates and embeds one if absent.
+This reads the embedded key and exits with instructions to run `rekey.py` if
+none is present.
 
 It listens on `0.0.0.0:53` by default (`--listen` to change). Binding port 53
 needs privileges; rather than running as root you can grant the capability
-**after** initializing the key:
+after adding the key:
 
 ```sh
-./cloudyday server --genkey
+python3 rekey.py ./cloudyday
 sudo setcap cap_net_bind_service=+ep ./cloudyday
 ```
 
-Key rotation replaces the file and drops this capability; reapply it afterward.
+Reapply the capability if key rotation removes it.
 
 By default the server refuses loopback, private, link-local (including cloud
 metadata), CGNAT, multicast, and other internal destinations, plus its own
@@ -203,10 +204,11 @@ Both sides can run on one machine, with the client talking to the server
 directly instead of through a resolver:
 
 ```sh
-cloudyday server --domain t.example.com --listen 127.0.0.1:5353 \
+python3 rekey.py ./cloudyday
+./cloudyday server --domain t.example.com --listen 127.0.0.1:5353 \
     --allow-private-destinations &
-sleep 1   # the server embeds a key; the client launches the replaced executable
-cloudyday client --domain t.example.com --resolver 127.0.0.1:5353 \
+sleep 1
+./cloudyday client --domain t.example.com --resolver 127.0.0.1:5353 \
     --listen 127.0.0.1:1080 &
 curl --socks5-hostname 127.0.0.1:1080 https://example.org/
 ```

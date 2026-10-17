@@ -35,10 +35,9 @@ One executable, with `client` and `server` subcommands:
 ```sh
 cloudyday server --domain t.example.com --listen 0.0.0.0:53
 cloudyday client --domain t.example.com --resolver 192.0.2.53:53
-cloudyday server --genkey   # create/rotate the embedded key, then exit
 
 # Both sides require the same 32-byte random secret embedded in the executable.
-# First server start generates it if absent; the client never generates one.
+# Add or rotate it externally with rekey.py before starting either side.
 # Securely copy the keyed executable to the client. No external key files.
 
 # Server only, off by default:
@@ -66,21 +65,15 @@ running inode through `/proc/self/exe`. Its trailer is exactly 32 raw key bytes
 followed by a fixed 32-byte marker (hex):
 `29d931f321c2dfe2d1459863bc8fd35bd0926386c07d02a85598b50abab058d8`.
 This marker was generated randomly once and is constant across builds; it is
-not a secret. The complete trailer is 64 bytes. An absent trailer is an error for
-clients. The server reuses an existing trailer, or generates one if absent.
-`server --genkey` always creates/replaces the key and exits without requiring
-`--domain`, a runtime, or sockets. There is no key-file option or legacy alias.
+not a secret. The complete trailer is 64 bytes. An absent trailer is an error
+for both server and client, with a message directing the operator to add one
+with `rekey.py`. The program only reads this trailer: it never generates,
+rotates, or writes keys, and there is no key-file option or legacy alias.
 
-Generate keys from OS randomness, not passwords: proofs permit offline guesses.
-Serialize updates with a lock on the executable's directory, copy the original
-binary without any existing trailer to a same-directory temporary file, append
-the new trailer, sync, and atomically rename over the executable. Refuse updates
-if the path no longer names the running inode. Set mode 0700; do not preserve
-capabilities, setuid/setgid, ownership, or extended attributes. Sync the directory
-after replacement and clean up temporary files on failure. Write permission on
-the directory is required only for initialization/rotation. The current process
-uses the new key from memory; subsequent launches read the new inode. Existing
-processes retain their old keys. Apply `setcap` after generation/rotation.
+Use `rekey.py` after building to add or rotate a key. Invoke it once with every
+architecture-specific executable that must share the same key. Generate keys
+from OS randomness, not passwords: proofs permit offline guesses. Apply
+`setcap` after keying the executable.
 
 Anyone able to read the executable can extract the key. Securely redistribute
 it after rotation and restart peers; finish stripping/building before embedding.

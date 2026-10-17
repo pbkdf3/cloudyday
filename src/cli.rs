@@ -1,4 +1,4 @@
-//! Command line, embedded key initialization, logging, and startup.
+//! Command line, embedded key loading, logging, and startup.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -33,15 +33,12 @@ struct Cli {
 enum Command {
     /// Answer tunnel queries as the domain's authoritative DNS server
     Server {
-        /// Tunnel domain delegated to this server (required unless --genkey)
-        #[arg(long, required_unless_present = "genkey")]
-        domain: Option<String>,
+        /// Tunnel domain delegated to this server
+        #[arg(long)]
+        domain: String,
         /// UDP address for DNS
         #[arg(long, default_value = "0.0.0.0:53")]
         listen: SocketAddr,
-        /// Embed a new random key in this executable (replacing any old key), then exit
-        #[arg(long)]
-        genkey: bool,
         /// Allow loopback, private, and other internal destinations
         #[arg(long)]
         allow_private_destinations: bool,
@@ -99,37 +96,18 @@ fn warn_no_integrity() {
     );
 }
 
-fn report_generated_key() {
-    info!(
-        "embedded a new shared secret in this executable; securely copy the executable to the client"
-    );
-    warn!(
-        "executable replaced with mode 0700; file capabilities were not preserved; reapply setcap if needed"
-    );
-}
-
 fn run(command: Command) -> Result<(), String> {
-    // Key-only operation must not require a domain, a Tokio runtime, or sockets.
-    if matches!(&command, Command::Server { genkey: true, .. }) {
-        embedded_key::server(true)?;
-        report_generated_key();
-        return Ok(());
-    }
+    let key = embedded_key::load()?;
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| format!("cannot start runtime: {e}"))?;
     let result = match command {
         Command::Server {
             domain,
             listen,
-            genkey: _,
             allow_private_destinations,
             reverse_socks,
         } => {
-            let domain = parse_domain(domain.as_deref().ok_or("--domain is required")?)?;
-            let (key, created) = embedded_key::server(false)?;
-            if created {
-                report_generated_key();
-            }
+            let domain = parse_domain(&domain)?;
             warn_no_integrity();
             if allow_private_destinations {
                 warn!(
@@ -159,7 +137,6 @@ fn run(command: Command) -> Result<(), String> {
             listen,
         } => {
             let domain = parse_domain(&domain)?;
-            let key = embedded_key::load()?;
             warn_no_integrity();
             warn!(
                 "the client always supports reverse SOCKS: the server can dial destinations on this client's network"
@@ -209,23 +186,23 @@ mod tests {
             panic!()
         };
         assert_eq!(listen, "127.0.0.1:1080".parse().unwrap());
-        let cli = Cli::try_parse_from(["cloudyday", "server", "--genkey"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Server {
-                domain: None,
-                genkey: true,
-                ..
-            }
-        ));
         assert!(Cli::try_parse_from(["cloudyday", "server"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cloudyday",
+                "server",
+                "--domain",
+                "t.example.com",
+                "--genkey",
+            ])
+            .is_err()
+        );
         assert!(Cli::try_parse_from(["cloudyday", "client", "--genkey"]).is_err());
         let cli =
             Cli::try_parse_from(["cloudyday", "server", "--domain", "t.example.com"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Server {
-                genkey: false,
                 reverse_socks: None,
                 ..
             }
